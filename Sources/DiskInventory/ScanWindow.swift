@@ -448,7 +448,7 @@ import SwiftUI
     private func prepareCleanup() {
         guard let snapshot else { return }
         if let cleanupModel {
-            if cleanupNeedsUpdate || !cleanupModel.analyzed {
+            if cleanupNeedsUpdate || (!cleanupModel.analyzed && !cleanupModel.analyzing) {
                 cleanupNeedsUpdate = false
                 cleanupModel.update(snapshot: snapshot)
             }

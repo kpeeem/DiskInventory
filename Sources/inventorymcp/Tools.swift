@@ -65,6 +65,7 @@ struct StoredScan {
     let seconds: Double
     let finishedAt: Date
     let held: [Int: Int64]
+    var cached = false
 
     func isFresh(at date: Date, maxAge: Double) -> Bool {
         date.timeIntervalSince(finishedAt) <= maxAge
@@ -83,6 +84,7 @@ struct StoredScan {
             "skipped": snapshot.issueCount,
             "traversal": snapshot.traversal.rawValue,
             "finder_kinds": finderKinds,
+            "cached": cached,
             "scanned_in_seconds": (seconds * 10).rounded() / 10,
             "finished_at": finishedAt,
         ]
@@ -100,6 +102,8 @@ final class ScanStore {
 
     private final class Job {
         let finished = DispatchGroup()
+        let started = ContinuousClock.now
+        var superseded = false
         var task: Task<Void, Never>?
         var result: Result<StoredScan, Error>?
         var waiters = 0
@@ -157,10 +161,15 @@ final class ScanStore {
                                       finishedAt: .now, held: held)
                 }
                 self.lock.withLock {
-                    if job.waiters > 0, case let .success(scan) = result {
-                        self.cache(scan, for: key)
+                    if job.waiters > 0, !job.superseded, case var .success(scan) = result {
+                        for (otherKey, other) in self.jobs where otherKey.path == key.path && other.started < job.started {
+                            other.superseded = true
+                        }
+                        scan.cached = self.cache(scan, for: key)
+                        job.result = .success(scan)
+                    } else {
+                        job.result = result
                     }
-                    job.result = result
                     job.task = nil
                     self.jobs.removeValue(forKey: key)
                     job.finished.leave()
@@ -183,17 +192,20 @@ final class ScanStore {
         scans = scans.filter { $0.value.isFresh(at: date, maxAge: Self.retention) }
     }
 
-    private func cache(_ scan: StoredScan, for key: Key) {
-        scans.removeValue(forKey: key)
-        guard scan.snapshot.nodes.count <= nodeLimit else { return }
+    private func cache(_ scan: StoredScan, for key: Key) -> Bool {
+        scans = scans.filter { $0.key.path != key.path }
+        guard scan.snapshot.nodes.count <= nodeLimit else { return false }
         prune(at: scan.finishedAt)
-        scans[key] = scan
+        var retained = scan
+        retained.cached = true
+        scans[key] = retained
         var nodes = scans.values.reduce(0) { $0 + $1.snapshot.nodes.count }
         for (oldest, value) in scans.sorted(by: { $0.value.finishedAt < $1.value.finishedAt }) {
             if scans.count <= snapshotLimit, nodes <= nodeLimit { break }
             scans.removeValue(forKey: oldest)
             nodes -= value.snapshot.nodes.count
         }
+        return scans[key] != nil
     }
 
     func recent(maxAge: Double = retention) -> [StoredScan] {
@@ -620,14 +632,33 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                     refused.append(["path": path, "why": "\(path) \(refusal)"])
                     continue
                 }
-                accepted.append(AdviceItem(path: path, size: adviceSize(path, store: store), verdict: verdict,
-                                           reason: (entry["reason"] as? String) ?? "", label: entry["title"] as? String))
+                let url = URL(filePath: path)
+                let identity = AdviceTrash.Identity(url: url)
+                let size = adviceSize(path, store: store)
+                guard verdict == .keep || (identity != nil && AdviceTrash.Identity(url: url) == identity) else {
+                    refused.append(["path": path, "why": "the item changed while the advice was being prepared"])
+                    continue
+                }
+                accepted.append(AdviceItem(path: path, size: size, verdict: verdict,
+                                           reason: (entry["reason"] as? String) ?? "", label: entry["title"] as? String,
+                                           fileIdentity: identity))
             }
             let append = try params.flag("append", fallback: false)
             let sheet = try AdviceStore.update { sheet in
                 var items = append ? sheet?.items ?? [] : []
-                let known = Set(items.map(\.key))
-                items += accepted.filter { !known.contains($0.key) }
+                var index: [String: Int] = [:]
+                for (offset, item) in items.enumerated() where index[item.key] == nil { index[item.key] = offset }
+                for item in accepted {
+                    if let offset = index[item.key] {
+                        let prior = items[offset]
+                        if prior.isRemovable, item.fileIdentity != nil, prior.fileIdentity != item.fileIdentity {
+                            items[offset] = item
+                        }
+                    } else {
+                        index[item.key] = items.count
+                        items.append(item)
+                    }
+                }
                 sheet = AdviceSheet(
                     title: params.string("title") ?? sheet?.title ?? "Cleanup advice",
                     summary: params.string("summary") ?? (append ? sheet?.summary ?? "" : ""),

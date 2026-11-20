@@ -38,10 +38,14 @@ public struct CleanupSelection {
     public struct Item: Equatable, Sendable {
         public let path: String
         public let size: Int64
+        public let node: Int?
+        public let fileIdentity: AdviceTrash.Identity?
 
-        public init(path: String, size: Int64) {
+        public init(path: String, size: Int64, node: Int? = nil, fileIdentity: AdviceTrash.Identity? = nil) {
             self.path = path
             self.size = size
+            self.node = node
+            self.fileIdentity = fileIdentity
         }
     }
 
@@ -189,6 +193,7 @@ public enum CleanupAnalyzer {
     private static let installerSuffixes: Set<String> = ["dmg", "pkg", "mpkg", "xip", "iso"]
 
     public static func analyze(_ snapshot: ScanSummary, home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [CleanupGroup] {
+        guard !Task.isCancelled else { return [] }
         let held = snapshot.heldByClones()
         let size: (Int) -> Int64 = { snapshot.reclaimable($0, held: held) }
         var claimed = Set<Int>()
@@ -201,6 +206,7 @@ public enum CleanupAnalyzer {
 
         let homePath = home.standardizedFileURL.path
         for rule in pathRules {
+            if Task.isCancelled { return [] }
             let path = rule.path.hasPrefix("/") ? rule.path : homePath + "/" + rule.path
             guard let id = snapshot.locate(path), snapshot.nodes[id].isDirectory else { continue }
             switch rule.pick {
@@ -238,6 +244,7 @@ public enum CleanupAnalyzer {
             stack = expandable(0) ? [0] : []
         }
         while let id = stack.popLast() {
+            if Task.isCancelled { return [] }
             let children = snapshot.children(of: id)
             var names: Set<String>?
             for child in children where expandable(child) {
@@ -261,6 +268,7 @@ public enum CleanupAnalyzer {
             guard let folderID = snapshot.locate(homePath + "/" + folder) else { continue }
             var pending = [folderID]
             while let id = pending.popLast() {
+                if Task.isCancelled { return [] }
                 for child in snapshot.children(of: id) {
                     let node = snapshot.nodes[child]
                     if node.isDirectory {
@@ -323,6 +331,7 @@ public enum CloudOffload {
         let homePath = home.standardizedFileURL.path
         var result: [StaleFile] = []
         for folder in folders {
+            if Task.isCancelled { return [] }
             let folderPath = homePath + "/" + folder
             let rootPath = snapshot.displayPath(of: 0)
             let scope: String
@@ -332,8 +341,17 @@ public enum CloudOffload {
                 folderID = id
             } else if rootPath.hasPrefix(folderPath + "/") {
                 let relative = rootPath.dropFirst(folderPath.count + 1)
-                guard !relative.split(separator: "/").contains(where: { $0.hasPrefix(".") }),
-                      !snapshot.kinds[Int(snapshot.nodes[0].kind)].isPackage else { continue }
+                var ancestor = URL(filePath: folderPath, directoryHint: .isDirectory)
+                var catalog = KindCatalog()
+                let permitted = relative.split(separator: "/").allSatisfy { component in
+                    let name = String(component)
+                    guard !name.hasPrefix(".") else { return false }
+                    ancestor.append(path: name, directoryHint: .isDirectory)
+                    let kind = catalog.kind(name: name, directory: true, symlink: false, alias: false)
+                    return !catalog.kinds[Int(kind)].isPackage
+                        && (try? ancestor.resourceValues(forKeys: [.isPackageKey]).isPackage) != true
+                }
+                guard permitted, !snapshot.kinds[Int(snapshot.nodes[0].kind)].isPackage else { continue }
                 scope = rootPath
                 folderID = 0
             } else {
@@ -342,6 +360,7 @@ public enum CloudOffload {
             var files: [Int] = []
             var stack = [folderID]
             while let id = stack.popLast() {
+                if Task.isCancelled { return [] }
                 for child in snapshot.children(of: id) {
                     let node = snapshot.nodes[child]
                     if node.isDirectory {
@@ -354,6 +373,7 @@ public enum CloudOffload {
             guard !files.isEmpty else { continue }
             let indexed = spotlightDates(in: scope, minSize: minSize)
             for id in files {
+                if Task.isCancelled { return [] }
                 let path = snapshot.displayPath(of: id)
                 let dates = indexed[path] ?? fileDates(path)
                 let file = StaleFile(
@@ -454,6 +474,7 @@ public enum CloudOffload {
         MDQueryStop(query)
         var result: [String: Dates] = [:]
         for index in 0..<MDQueryGetResultCount(query) {
+            if Task.isCancelled { return [:] }
             guard let raw = MDQueryGetResultAtIndex(query, index) else { continue }
             let item = Unmanaged<MDItem>.fromOpaque(raw).takeUnretainedValue()
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { continue }
@@ -477,7 +498,9 @@ public extension ScanSummary {
 
     func heldByClones() -> [Int: Int64] {
         var families: [Inode: [Int]] = [:]
-        for id in nodes.indices where nodes[id].isShared {
+        for id in nodes.indices {
+            if id.isMultiple(of: 1024), Task.isCancelled { return [:] }
+            guard nodes[id].isShared else { continue }
             families[Inode(device: nodes[id].device, number: nodes[id].shared), default: []].append(id)
         }
         var held: [Int: Int64] = [:]

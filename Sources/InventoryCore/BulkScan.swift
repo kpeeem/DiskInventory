@@ -90,7 +90,7 @@ enum BulkScan {
 
     private struct Partial {
         var nodes: [FileNode]
-        var kinds: [FileKind]
+        let worker: Int
         var issues: [ScanIssue]
         var issueCount: Int
     }
@@ -100,6 +100,7 @@ enum BulkScan {
         private let progress: (ScanProgress) -> Void
         private var units: [Unit]
         private var partials: [Partial?] = [nil]
+        private var catalogs: [[FileKind]]
         private var pending = [0]
         private var active = 0
         private var failure: Error?
@@ -112,6 +113,7 @@ enum BulkScan {
 
         init(root: Unit, workers: Int, progress: @escaping (ScanProgress) -> Void) {
             units = [root]
+            catalogs = Array(repeating: [], count: workers)
             self.workers = workers
             self.progress = progress
         }
@@ -188,14 +190,18 @@ enum BulkScan {
             progress(ScanProgress(entries: entries, path: path(), traversal: .bulk, bytes: bytes))
         }
 
-        func outcome(finishing path: String) throws -> (units: [Unit], partials: [Partial]) {
+        func finishCatalog(_ kinds: [FileKind], worker: Int) {
+            condition.withLock { catalogs[worker] = kinds }
+        }
+
+        func outcome(finishing path: String) throws -> (units: [Unit], partials: [Partial], catalogs: [[FileKind]]) {
             condition.lock()
             defer { condition.unlock() }
             if let failure { throw failure }
             progress(ScanProgress(entries: entries, path: path, traversal: .bulk, finishing: true, bytes: bytes))
             let finished = partials.map { $0! }
             partials = []
-            return (units, finished)
+            return (units, finished, catalogs)
         }
     }
 
@@ -243,23 +249,24 @@ enum BulkScan {
             workers: max(2, ProcessInfo.processInfo.activeProcessorCount),
             progress: progress
         )
-        DispatchQueue.concurrentPerform(iterations: coordinator.workers) { _ in
+        DispatchQueue.concurrentPerform(iterations: coordinator.workers) { worker in
             let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: 256 * 1024, alignment: 8)
             defer { buffer.deallocate() }
             var catalog = KindCatalog()
+            defer { coordinator.finishCatalog(catalog.kinds, worker: worker) }
             while let index = coordinator.next() {
                 coordinator.finish(index, with: Result {
-                    try scanUnit(index, coordinator: coordinator, device: rootInfo.st_dev,
+                    try scanUnit(index, worker: worker, coordinator: coordinator, device: rootInfo.st_dev,
                                  ignoreCreatorCode: ignoreCreatorCode, buffer: buffer, catalog: &catalog)
                 })
             }
         }
-        var (units, partials) = try coordinator.outcome(finishing: rootPath)
-        return try merge(root: root, units: &units, partials: &partials, ignoreCreatorCode: ignoreCreatorCode)
+        var (units, partials, catalogs) = try coordinator.outcome(finishing: rootPath)
+        return try merge(root: root, units: units, partials: &partials, catalogs: catalogs, ignoreCreatorCode: ignoreCreatorCode)
     }
 
     private static func scanUnit(
-        _ index: Int, coordinator: Coordinator, device rootDevice: Int32, ignoreCreatorCode: Bool,
+        _ index: Int, worker: Int, coordinator: Coordinator, device rootDevice: Int32, ignoreCreatorCode: Bool,
         buffer: UnsafeMutableRawBufferPointer, catalog: inout KindCatalog
     ) throws -> Partial {
         let unit = coordinator.unit(index)
@@ -290,7 +297,7 @@ enum BulkScan {
         }
 
         func partial() -> Partial {
-            Partial(nodes: nodes, kinds: catalog.kinds, issues: issues, issueCount: issueCount)
+            Partial(nodes: nodes, worker: worker, issues: issues, issueCount: issueCount)
         }
 
         let descriptor = unit.path.withCString { open($0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW) }
@@ -485,7 +492,9 @@ enum BulkScan {
         return partial()
     }
 
-    private static func merge(root: URL, units: inout [Unit], partials: inout [Partial], ignoreCreatorCode: Bool) throws -> ScanSummary {
+    private static func merge(
+        root: URL, units: [Unit], partials: inout [Partial], catalogs: [[FileKind]], ignoreCreatorCode: Bool
+    ) throws -> ScanSummary {
         let total = partials.reduce(1) { $0 + $1.nodes.count - 1 }
         guard total < Int32.max else { throw ScanError.tooManyEntries }
         var kinds: [FileKind] = []
@@ -498,17 +507,21 @@ enum BulkScan {
         var issues: [ScanIssue] = []
         var issueCount = 0
 
+        var kindMaps = [[Int32]?](repeating: nil, count: catalogs.count)
         for index in partials.indices {
             if index.isMultiple(of: 64) { try Task.checkCancellation() }
             let partial = partials[index]
-            partials[index] = Partial(nodes: [], kinds: [], issues: [], issueCount: 0)
-            let kindMap = partial.kinds.map { kind -> Int32 in
-                if let existing = kindIndex[kind] { return existing }
-                let id = Int32(kinds.count)
-                kinds.append(kind)
-                kindIndex[kind] = id
-                return id
+            partials[index] = Partial(nodes: [], worker: partial.worker, issues: [], issueCount: 0)
+            if kindMaps[partial.worker] == nil {
+                kindMaps[partial.worker] = catalogs[partial.worker].map { kind -> Int32 in
+                    if let existing = kindIndex[kind] { return existing }
+                    let id = Int32(kinds.count)
+                    kinds.append(kind)
+                    kindIndex[kind] = id
+                    return id
+                }
             }
+            let kindMap = kindMaps[partial.worker]!
             if index == 0 {
                 var rootNode = partial.nodes[0]
                 rootNode.kind = kindMap[Int(rootNode.kind)]

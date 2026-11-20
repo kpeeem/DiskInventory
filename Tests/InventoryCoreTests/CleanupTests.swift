@@ -250,3 +250,101 @@ private func temporaryHome() throws -> URL {
     #expect(updated.nodes[0].allocated == full.nodes[0].allocated)
     #expect(updated.nodes[0].fileCount == full.nodes[0].fileCount)
 }
+
+@Test func cloudOffloadSkipsAStandaloneScanInsideAPhotosLibrary() throws {
+    let home = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let originals = home.appending(path: "Pictures/Sample.photoslibrary/originals")
+    try makeFile(originals.appending(path: "original"), bytes: 65_536, age: 500)
+
+    for url in [home.appending(path: "Pictures"), originals] {
+        let snapshot = try InventoryScanner.scan(url)
+        #expect(CloudOffload.staleFiles(in: snapshot, minSize: 32_768, olderThanDays: 180, home: home).isEmpty)
+    }
+}
+
+@Test func persistedAdviceRefusesAReplacementOutsideTheScan() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appending(path: "suggested")
+    try makeFile(file)
+    let identity = try #require(AdviceTrash.Identity(url: file))
+    let item = AdviceItem(path: file.path, size: 16_384, verdict: .safe, reason: "Sample", fileIdentity: identity)
+    let persisted = try JSONDecoder().decode(AdviceItem.self, from: JSONEncoder().encode(item))
+
+    try FileManager.default.moveItem(at: file, to: root.appending(path: "preserved"))
+    try makeFile(file, bytes: 8192)
+    let originalIdentity = try #require(persisted.fileIdentity)
+    let target = AdviceTrash.Target(url: file, identity: originalIdentity)
+    #expect(throws: CocoaError.self) { try AdviceTrash.move(target) }
+    #expect(try Data(contentsOf: file).count == 8192)
+
+    var legacy = item
+    legacy.fileIdentity = nil
+    #expect(try JSONDecoder().decode(AdviceItem.self, from: JSONEncoder().encode(legacy)).fileIdentity == nil)
+}
+
+@Test(arguments: [false, true]) func partialRefreshReconcilesNewSharedFiles(clone: Bool) throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let original = root.appending(path: "original")
+    let folder = root.appending(path: "other")
+    let copy = folder.appending(path: "copy")
+    try makeFile(original, bytes: 4 << 20)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let old = try InventoryScanner.scan(root)
+    if clone {
+        #expect(clonefile(original.path, copy.path, 0) == 0)
+    } else {
+        try FileManager.default.linkItem(at: original, to: copy)
+    }
+
+    let incremental = try InventoryScanner.refresh(try #require(old.find(folder)), in: old)
+    let full = try InventoryScanner.scan(root)
+    #expect(incremental.nodes[0].allocated == old.nodes[0].allocated)
+    #expect(incremental.nodes[0].allocated == full.nodes[0].allocated)
+    let held = incremental.heldByClones()
+    let before = try #require(incremental.find(original))
+    let after = try #require(incremental.find(copy))
+    #expect(incremental.reclaimable(before, held: held) == 0)
+    #expect(incremental.reclaimable(after, held: held) == 0)
+    #expect(incremental.reclaimable(0, held: held) == full.reclaimable(0, held: full.heldByClones()))
+    #expect(incremental.reclaimable(0, held: held) == 4 << 20)
+}
+
+@Test func movingInsideScanPreservesRemovalWhenDestinationIsUnreadable() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let source = root.appending(path: "source")
+    let destination = root.appending(path: ".Trash", directoryHint: .isDirectory)
+    try makeFile(source)
+    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    let initial = try InventoryScanner.scan(root)
+    try FileManager.default.moveItem(at: source, to: destination.appending(path: "source"))
+    try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: destination.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path) }
+
+    let updated = try InventoryScanner.updating(initial, removed: [source], refreshing: [destination])
+    #expect(updated.find(source) == nil)
+    #expect(updated.issues.contains { $0.path == destination.path })
+}
+
+@Test func batchRefreshUpdatesSeparateFoldersAndFiles() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let folder = root.appending(path: "folder", directoryHint: .isDirectory)
+    let nested = folder.appending(path: "nested")
+    let other = root.appending(path: "other")
+    let missing = root.appending(path: "missing")
+    for url in [nested, other, missing] { try makeFile(url, bytes: 8192) }
+    let initial = try InventoryScanner.scan(root)
+    try makeFile(nested, bytes: 16_384)
+    try makeFile(other, bytes: 32_768)
+    try FileManager.default.removeItem(at: missing)
+    let updated = try InventoryScanner.updating(initial, removed: [], refreshing: [folder, nested, other, missing])
+    let full = try InventoryScanner.scan(root)
+    #expect(updated.find(missing) == nil)
+    #expect(updated.nodes[try #require(updated.find(nested))].logical == 16_384)
+    #expect(updated.nodes[try #require(updated.find(other))].logical == 32_768)
+    #expect(updated.nodes[0].logical == full.nodes[0].logical)
+}

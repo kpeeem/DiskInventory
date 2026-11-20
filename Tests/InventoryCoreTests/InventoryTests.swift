@@ -242,3 +242,27 @@ import Testing
     #expect(firstKind == secondKind)
     #expect(requests == 2)
 }
+
+@Test func bulkWorkersPreserveKindsAcrossManySubtrees() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? fm.removeItem(at: root) }
+    var files: [URL] = []
+    for index in 0..<96 {
+        let folder = root.appending(path: "folder-\(index)", directoryHint: .isDirectory)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        for name in ["document.txt", "source.swift", "unique.sampletype\(index)"] {
+            let url = folder.appending(path: name)
+            try Data([1]).write(to: url)
+            files.append(url)
+        }
+    }
+
+    let bulk = try InventoryScanner.scan(root)
+    let sequential = try InventoryScanner.scan(root, preferBulk: false)
+    for url in files {
+        let parallelID = try #require(bulk.find(url))
+        let sequentialID = try #require(sequential.find(url))
+        #expect(bulk.kinds[Int(bulk.nodes[parallelID].kind)] == sequential.kinds[Int(sequential.nodes[sequentialID].kind)])
+    }
+}

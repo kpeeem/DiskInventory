@@ -23,8 +23,10 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
     public var argument: String?
     public var output: String?
     public var label: String?
+    public var fileIdentity: AdviceTrash.Identity?
 
-    public init(path: String, size: Int64, verdict: AdviceVerdict, reason: String, action: String? = nil, argument: String? = nil, label: String? = nil) {
+    public init(path: String, size: Int64, verdict: AdviceVerdict, reason: String, action: String? = nil, argument: String? = nil, label: String? = nil,
+                fileIdentity: AdviceTrash.Identity? = nil) {
         id = UUID()
         self.path = path
         self.size = size
@@ -35,6 +37,7 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
         self.action = action
         self.argument = argument
         self.label = label ?? action.flatMap { AdviceActions.definition($0)?.title(argument) }
+        self.fileIdentity = fileIdentity
     }
 
     public var isAction: Bool { action != nil }
@@ -427,14 +430,20 @@ public enum AdviceActions {
                 data.append(contentsOf: buffer.prefix(count))
                 continue
             }
-            if !exited {
-                let waited = waitpid(pid, &status, WNOHANG)
-                if waited < 0 && errno != EINTR { return (-1, String(cString: strerror(errno))) }
-                exited = waited == pid
+            if count < 0 {
+                if errno == EINTR { continue }
+                if errno != EAGAIN && errno != EWOULDBLOCK { return (-1, String(cString: strerror(errno))) }
             }
             if exited {
                 let code = status & 0x7f == 0 ? (status >> 8) & 0xff : -1
                 return (code, String(decoding: data, as: UTF8.self))
+            }
+            let waited = waitpid(pid, &status, WNOHANG)
+            if waited < 0 && errno != EINTR { return (-1, String(cString: strerror(errno))) }
+            if waited == pid {
+                // The child can write to the pipe between the read and waitpid.
+                exited = true
+                continue
             }
             if count == 0 {
                 usleep(10_000)
@@ -522,23 +531,34 @@ public enum AdviceActions {
 }
 
 public enum AdviceTrash {
-    public struct Target: Sendable {
-        public let url: URL
+    public struct Identity: Codable, Hashable, Sendable {
         let device: Int32
         let inode: UInt64
-
-        public init(url: URL, node: FileNode) {
-            self.url = url
-            device = node.device
-            inode = node.inode
-        }
 
         public init?(url: URL) {
             var info = stat()
             guard lstat(url.path, &info) == 0 else { return nil }
-            self.url = url
             device = info.st_dev
             inode = info.st_ino
+        }
+
+        public init(node: FileNode) {
+            device = node.device
+            inode = node.inode
+        }
+    }
+
+    public struct Target: Sendable {
+        public let url: URL
+        let identity: Identity
+
+        public init(url: URL, identity: Identity) {
+            self.url = url
+            self.identity = identity
+        }
+
+        public init(url: URL, node: FileNode) {
+            self.init(url: url, identity: Identity(node: node))
         }
     }
 
@@ -550,8 +570,7 @@ public enum AdviceTrash {
     public static func move(_ target: Target) throws -> Move {
         let url = target.url
         let parent = url.deletingLastPathComponent().standardizedFileURL
-        var info = stat()
-        guard lstat(url.path, &info) == 0, info.st_dev == target.device, info.st_ino == target.inode,
+        guard Identity(url: url) == target.identity,
               parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else {
             throw CocoaError(.fileNoSuchFile, userInfo: [
                 NSLocalizedDescriptionKey: "This item changed since it was selected. Refresh before moving it to Trash."

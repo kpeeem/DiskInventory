@@ -41,6 +41,7 @@ import SwiftUI
     private var revision = UUID()
     private var staleRevision = UUID()
     private var analysis: Task<Void, Never>?
+    private var staleWorker: Task<[StaleFile], Never>?
     private(set) var selection = CleanupSelection(kept: [])
 
     init(snapshot: ScanSummary, apply: @escaping Apply) {
@@ -58,12 +59,12 @@ import SwiftUI
     var removable: [CleanupItem] { groups.filter { $0.category != CleanupCategories.trash }.flatMap(\.items) }
     var chosen: [CleanupSelection.Item] {
         let advice = pendingAdvice.filter { adviceSelected.contains($0.id) }.map {
-            CleanupSelection.Item(path: canonicalPath($0.path), size: $0.size)
+            CleanupSelection.Item(path: canonicalPath($0.path), size: $0.size, fileIdentity: $0.fileIdentity)
         }
         let rules = removable.filter { selected.contains($0.node) }.map {
-            CleanupSelection.Item(path: path(of: $0.node), size: $0.size)
+            CleanupSelection.Item(path: path(of: $0.node), size: $0.size, node: $0.node)
         }
-        return selection.collapse(rules + advice)
+        return selection.collapse(advice + rules)
     }
     var canWork: Bool { !analyzing && working == nil && scanIsIdle() }
     var chosenLocal: [StaleFile] { stale.filter { staleSelected.contains($0.node) && !$0.isInICloud && !selection.protects($0.path) } }
@@ -97,6 +98,7 @@ import SwiftUI
 
     func update(snapshot: ScanSummary) {
         analysis?.cancel()
+        staleWorker?.cancel()
         self.snapshot = snapshot
         revision = UUID()
         groups = []
@@ -131,7 +133,12 @@ import SwiftUI
         let snapshot = snapshot
         let revision = revision
         async let refreshStale: Void = findStale()
-        let groups = await Task.detached(priority: .userInitiated) { CleanupAnalyzer.analyze(snapshot) }.value
+        let worker = Task.detached(priority: .userInitiated) { CleanupAnalyzer.analyze(snapshot) }
+        let groups = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
         await refreshStale
         guard revision == self.revision, !Task.isCancelled else { return }
         self.groups = groups
@@ -150,10 +157,21 @@ import SwiftUI
         let snapshot = snapshot
         let days = Double(days)
         let minimum = minimum
-        let files = await Task.detached(priority: .userInitiated) {
-            CloudOffload.staleFiles(in: snapshot, minSize: minimum, olderThanDays: days)
-        }.value
+        let previous = staleWorker
+        previous?.cancel()
+        let worker = Task.detached(priority: .userInitiated) {
+            _ = await previous?.value
+            guard !Task.isCancelled else { return [StaleFile]() }
+            return CloudOffload.staleFiles(in: snapshot, minSize: minimum, olderThanDays: days)
+        }
+        staleWorker = worker
+        let files = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
         guard revision == self.revision, request == staleRevision, !Task.isCancelled else { return }
+        staleWorker = nil
         stale = files
         staleSelected = []
     }
@@ -171,12 +189,12 @@ import SwiftUI
         var targets: [AdviceTrash.Target] = []
         var missing: [String] = []
         for item in items {
-            if let id = snapshot.locate(item.path) {
+            if let id = item.node {
                 targets.append(AdviceTrash.Target(url: snapshot.url(for: id), node: snapshot.nodes[id]))
-            } else if let target = AdviceTrash.Target(url: URL(filePath: item.path)) {
-                targets.append(target)
+            } else if let identity = item.fileIdentity {
+                targets.append(AdviceTrash.Target(url: URL(filePath: item.path), identity: identity))
             } else {
-                missing.append("\(item.path): This item is no longer on disk.")
+                missing.append("\(item.path): This advice needs to be refreshed before the item can be moved.")
             }
         }
         return TrashPlan(revision: revision, items: items, targets: targets, missing: missing)

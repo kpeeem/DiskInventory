@@ -440,27 +440,73 @@ public enum InventoryScanner {
         in previous: ScanSummary,
         progress: (ScanProgress) -> Void = { _ in }
     ) throws -> ScanSummary {
-        guard id > 0, previous.nodes.indices.contains(id), previous.issueCount == previous.issues.count else {
+        switch try replacement(for: id, in: previous, progress: progress) {
+        case .wholeTree:
             return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
+        case let .subtree(updated):
+            if try sharingChanged(at: id, in: previous, replacement: updated) {
+                return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
+            }
+            var replacements: [Int: ScanSummary] = [:]
+            replacements[id] = updated
+            return try rebuilding(previous, removing: updated == nil ? [id] : [], replacing: replacements)
+        }
+    }
+
+    private enum Replacement {
+        case wholeTree
+        case subtree(ScanSummary?)
+    }
+
+    private static func replacement(
+        for id: Int, in previous: ScanSummary, progress: (ScanProgress) -> Void = { _ in }
+    ) throws -> Replacement {
+        guard id > 0, previous.nodes.indices.contains(id), previous.issueCount == previous.issues.count else {
+            return .wholeTree
         }
         let target = previous.url(for: id)
         let parent = target.deletingLastPathComponent().standardizedFileURL
-        guard parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else {
-            return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
-        }
-        let replacement: ScanSummary?
+        guard parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else { return .wholeTree }
         do {
-            replacement = try scan(target, directoryOnly: false, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
+            let updated = try scan(target, directoryOnly: false, ignoreCreatorCode: previous.ignoreCreatorCode,
+                                   preferBulk: previous.traversal == .bulk, progress: progress)
+            return updated.nodes[0].device == previous.nodes[0].device ? .subtree(updated) : .wholeTree
         } catch ScanError.filesystem(_, ENOENT) {
-            replacement = nil
+            return .subtree(nil)
         } catch ScanError.filesystem(_, ENOTDIR) {
-            return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
+            return .wholeTree
         }
-        if let replacement, replacement.nodes[0].device != previous.nodes[0].device {
-            return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode, progress: progress)
-        }
+    }
 
-        return try replacing(id, in: previous, with: replacement)
+    private struct Sharing: Hashable {
+        let file: Inode
+        let family: UInt64
+        let references: UInt32
+        let hardLinks: UInt16
+    }
+
+    private static func sharingChanged(at id: Int, in previous: ScanSummary, replacement: ScanSummary?) throws -> Bool {
+        func sharing(in scan: ScanSummary, root: Int) throws -> Set<Sharing> {
+            var entries: Set<Sharing> = []
+            var stack = [root]
+            var visited = 0
+            while let index = stack.popLast() {
+                if visited.isMultiple(of: 1024) { try Task.checkCancellation() }
+                visited += 1
+                let item = scan.nodes[index]
+                if item.isShared {
+                    entries.insert(Sharing(file: Inode(device: item.device, number: item.inode), family: item.shared,
+                                           references: item.references, hardLinks: item.hardLinks))
+                }
+                if item.firstChild >= 0 { stack.append(Int(item.firstChild)) }
+                if index != root, item.nextSibling >= 0 { stack.append(Int(item.nextSibling)) }
+            }
+            return entries
+        }
+        let before = try sharing(in: previous, root: id)
+        let after = try replacement.map { try sharing(in: $0, root: 0) } ?? []
+        // Other branches can still carry identities from before a clone or hard link was created.
+        return before != after
     }
 
     public static func removing(_ id: Int, from previous: ScanSummary) throws -> ScanSummary {
@@ -510,33 +556,77 @@ public enum InventoryScanner {
     }
 
     public static func updating(_ previous: ScanSummary, removed: [URL], refreshing: [URL]) throws -> ScanSummary {
-        var parents = Set<String>()
+        let locations = locate(removed + refreshing, in: previous)
+        var removedIDs = Set(removed.compactMap { locations[$0] }.filter { $0 > 0 })
+        var refreshIDs = Set<Int>()
         for url in refreshing {
+            if let id = locations[url] {
+                refreshIDs.insert(id)
+                continue
+            }
             var folder = url.standardizedFileURL
-            while previous.locate(folder.path) == nil, folder.path != "/" {
+            while folder.path != "/", !folder.path.isEmpty {
                 folder.deleteLastPathComponent()
-            }
-            if let id = previous.locate(folder.path) {
-                if id == 0 { return try refresh(0, in: previous) }
-                parents.insert(previous.url(for: id).path)
-            }
-        }
-        var ids = Set<Int>()
-        for (parent, urls) in Dictionary(grouping: removed, by: { $0.deletingLastPathComponent().path }) {
-            guard let id = previous.locate(parent) else { continue }
-            var names = Set(urls.map(\.lastPathComponent))
-            for child in previous.children(of: id) where names.remove(previous.nodes[child].name) != nil {
-                ids.insert(child)
-            }
-            for name in names {
-                if let child = previous.locate(URL(filePath: parent).appending(path: name).path) { ids.insert(child) }
+                if let id = previous.locate(folder.path) {
+                    refreshIDs.insert(id)
+                    break
+                }
             }
         }
-        var result = try removing(ids, from: previous)
-        for path in parents.sorted() {
-            guard !parents.contains(where: { $0 != path && CleanupSelection.contains($0, path) }),
-                  let id = result.locate(path) else { continue }
-            result = try refresh(id, in: result)
+
+        var replacements: [Int: ScanSummary] = [:]
+        var failures: [ScanIssue] = []
+        var needsFullScan = false
+        for id in refreshIDs.sorted() {
+            try Task.checkCancellation()
+            guard !previous.lineage(of: id).dropLast().contains(where: refreshIDs.contains) else { continue }
+            do {
+                switch try replacement(for: id, in: previous) {
+                case .wholeTree:
+                    needsFullScan = true
+                case let .subtree(updated):
+                    if try sharingChanged(at: id, in: previous, replacement: updated) { needsFullScan = true }
+                    if let updated {
+                        replacements[id] = updated
+                        removedIDs.remove(id)
+                    } else {
+                        removedIDs.insert(id)
+                    }
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                failures.append(ScanIssue(path: previous.url(for: id).path, message: error.localizedDescription))
+            }
+        }
+        if needsFullScan {
+            do {
+                return try scan(previous.root, ignoreCreatorCode: previous.ignoreCreatorCode)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                failures.append(ScanIssue(path: previous.root.path, message: error.localizedDescription))
+            }
+        }
+        if replacements.isEmpty && failures.isEmpty { return try removing(removedIDs, from: previous) }
+        return try rebuilding(previous, removing: removedIDs, replacing: replacements, failures: failures)
+    }
+
+    private static func locate(_ urls: [URL], in snapshot: ScanSummary) -> [URL: Int] {
+        var result: [URL: Int] = [:]
+        for (parent, siblings) in Dictionary(grouping: Set(urls), by: { $0.deletingLastPathComponent() }) {
+            if siblings.count > 1, let parentID = snapshot.locate(parent.path) {
+                var names = Dictionary(grouping: siblings, by: \.lastPathComponent)
+                for child in snapshot.children(of: parentID) {
+                    if let matches = names.removeValue(forKey: snapshot.nodes[child].name) {
+                        for match in matches { result[match] = child }
+                        if names.isEmpty { break }
+                    }
+                }
+            }
+            for url in siblings where result[url] == nil {
+                result[url] = snapshot.locate(url.path)
+            }
         }
         return result
     }
@@ -552,55 +642,55 @@ public enum InventoryScanner {
         return max(0, info.st_blocks) * 512
     }
 
-    private static func replacing(_ id: Int, in previous: ScanSummary, with replacement: ScanSummary?) throws -> ScanSummary {
-        try rebuilding(previous, removing: [id], inserting: replacement.map { (id, $0) })
-    }
-
     private static func rebuilding(
-        _ previous: ScanSummary, removing removed: Set<Int>, inserting insertion: (id: Int, scan: ScanSummary)? = nil
+        _ previous: ScanSummary, removing removed: Set<Int>, replacing replacements: [Int: ScanSummary] = [:],
+        failures: [ScanIssue] = []
     ) throws -> ScanSummary {
-        let replacement = insertion?.scan
         var kinds = previous.kinds
         var kindIndex = Dictionary(uniqueKeysWithValues: kinds.enumerated().map { ($1, Int32($0)) })
-        let newKinds = (replacement?.kinds ?? []).map { kind in
-            if let index = kindIndex[kind] { return index }
-            let index = Int32(kinds.count)
-            kinds.append(kind)
-            kindIndex[kind] = index
-            return index
+        var newKinds: [Int: [Int32]] = [:]
+        for (id, replacement) in replacements.sorted(by: { $0.key < $1.key }) {
+            newKinds[id] = replacement.kinds.map { kind in
+                if let index = kindIndex[kind] { return index }
+                let index = Int32(kinds.count)
+                kinds.append(kind)
+                kindIndex[kind] = index
+                return index
+            }
         }
         struct Entry {
             let source: Int
             let parent: Int32
-            let replacement: Bool
+            let replacement: Int?
         }
-        var work = [Entry(source: 0, parent: -1, replacement: false)]
+        var work = [Entry(source: 0, parent: -1, replacement: nil)]
         var nodes: [FileNode] = []
         nodes.reserveCapacity(previous.nodes.count)
         var linked = Set<Inode>()
         var possibleLinks = Set<Inode>()
-        for group in [previous.nodes, replacement?.nodes ?? []] {
+        for group in [previous.nodes] + replacements.values.map(\.nodes) {
             for node in group where node.isShared {
                 possibleLinks.insert(Inode(device: node.device, number: node.shared))
             }
         }
         while let entry = work.popLast() {
             if nodes.count.isMultiple(of: 1024) { try Task.checkCancellation() }
-            let source = entry.replacement ? (replacement?.nodes ?? []) : previous.nodes
+            let source = entry.replacement.map { replacements[$0]!.nodes } ?? previous.nodes
             let item = source[entry.source]
-            if item.nextSibling >= 0, !entry.replacement || entry.source != 0 {
+            if item.nextSibling >= 0, entry.replacement == nil || entry.source != 0 {
                 work.append(Entry(source: Int(item.nextSibling), parent: entry.parent, replacement: entry.replacement))
             }
-            if !entry.replacement, removed.contains(entry.source) {
-                if entry.source == insertion?.id {
-                    work.append(Entry(source: 0, parent: entry.parent, replacement: true))
+            if entry.replacement == nil {
+                if removed.contains(entry.source) { continue }
+                if replacements[entry.source] != nil {
+                    work.append(Entry(source: 0, parent: entry.parent, replacement: entry.source))
+                    continue
                 }
-                continue
             }
             guard nodes.count < Int32.max else { throw ScanError.tooManyEntries }
             var node = item
             let index = Int32(nodes.count)
-            if entry.replacement { node.kind = newKinds[Int(node.kind)] }
+            if let id = entry.replacement { node.kind = newKinds[id]![Int(node.kind)] }
             node.parent = entry.parent
             node.firstChild = -1
             node.nextSibling = -1
@@ -631,12 +721,13 @@ public enum InventoryScanner {
                 nodes[Int(parent)].fileCount += nodes[i].fileCount
             }
         }
-        let paths = previous.issues.isEmpty ? [] : removed.map { previous.url(for: $0).path }
+        let paths = previous.issues.isEmpty ? [] : removed.union(replacements.keys).map { previous.url(for: $0).path }
         let outside = previous.issues.filter { issue in
             !paths.contains { issue.path == $0 || issue.path.hasPrefix($0 + "/") }
         }
-        let issueCount = previous.issueCount - (previous.issues.count - outside.count) + (replacement?.issueCount ?? 0)
-        let issues = outside + (replacement?.issues ?? [])
+        let issueCount = previous.issueCount - (previous.issues.count - outside.count)
+            + replacements.values.reduce(failures.count) { $0 + $1.issueCount }
+        let issues = failures + outside + replacements.values.flatMap(\.issues)
         let volume = previous.volume == nil ? nil : VolumeUsage.read(previous.root)
         return ScanSummary(root: previous.root, nodes: nodes, kinds: kinds, issues: Array(issues.prefix(250)), issueCount: issueCount, volume: volume, ignoreCreatorCode: previous.ignoreCreatorCode, traversal: previous.traversal)
     }
