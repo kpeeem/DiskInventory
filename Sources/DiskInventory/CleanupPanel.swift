@@ -5,8 +5,18 @@ import SwiftUI
 @MainActor @Observable final class CleanupModel {
     typealias Apply = @MainActor (_ removed: [URL], _ refreshed: [URL]) async -> ScanSummary?
 
+    struct TrashPlan {
+        let revision: UUID
+        let items: [CleanupSelection.Item]
+        let targets: [AdviceTrash.Target]
+        let missing: [String]
+
+        var size: Int64 { items.reduce(0) { $0 + $1.size } }
+    }
+
     private(set) var snapshot: ScanSummary
     private let apply: Apply
+    var scanIsIdle: () -> Bool = { true }
     var reveal: ((String) -> Void)?
     var quickLook: ((String) -> Void)?
     var candidatesChanged: (() -> Void)?
@@ -28,12 +38,16 @@ import SwiftUI
     let destinations = CloudOffload.destinations()
     var destination: CloudDestination?
     let home = FileManager.default.homeDirectoryForCurrentUser.path
+    private var revision = UUID()
+    private var staleRevision = UUID()
+    private var analysis: Task<Void, Never>?
+    private(set) var selection = CleanupSelection(kept: [])
 
     init(snapshot: ScanSummary, apply: @escaping Apply) {
         self.snapshot = snapshot
         self.apply = apply
         destination = destinations.first
-        advice = AdviceStore.load()
+        reloadAdvice()
     }
 
     var coversHome: Bool {
@@ -42,22 +56,27 @@ import SwiftUI
 
     var pendingAdvice: [AdviceItem] { advice?.items.filter(\.isRemovable) ?? [] }
     var removable: [CleanupItem] { groups.filter { $0.category != CleanupCategories.trash }.flatMap(\.items) }
-    var chosenAdvice: [AdviceItem] { pendingAdvice.filter { adviceSelected.contains($0.id) } }
-    var chosenRules: [CleanupItem] {
-        let advised = Set(chosenAdvice.map(\.path))
-        return removable.filter { selected.contains($0.node) && !advised.contains(path(of: $0.node)) }
+    var chosen: [CleanupSelection.Item] {
+        let advice = pendingAdvice.filter { adviceSelected.contains($0.id) }.map {
+            CleanupSelection.Item(path: canonicalPath($0.path), size: $0.size)
+        }
+        let rules = removable.filter { selected.contains($0.node) }.map {
+            CleanupSelection.Item(path: path(of: $0.node), size: $0.size)
+        }
+        return selection.collapse(rules + advice)
     }
-    var chosenCount: Int { chosenAdvice.count + chosenRules.count }
-    var chosenSize: Int64 { chosenAdvice.reduce(0) { $0 + $1.size } + chosenRules.reduce(0) { $0 + $1.size } }
-    var chosenLocal: [StaleFile] { stale.filter { staleSelected.contains($0.node) && !$0.isInICloud } }
-    var chosenInICloud: [StaleFile] { stale.filter { staleSelected.contains($0.node) && $0.isInICloud } }
+    var canWork: Bool { !analyzing && working == nil && scanIsIdle() }
+    var chosenLocal: [StaleFile] { stale.filter { staleSelected.contains($0.node) && !$0.isInICloud && !selection.protects($0.path) } }
+    var chosenInICloud: [StaleFile] { stale.filter { staleSelected.contains($0.node) && $0.isInICloud && !selection.protects($0.path) } }
     var sortedStale: [StaleFile] {
         sortStaleByDate ? stale.sorted { ($0.lastActivity ?? .distantPast) < ($1.lastActivity ?? .distantPast) } : stale
     }
 
     var candidateIDs: Set<Int> {
-        var ids = Set(removable.map(\.node))
-        for item in pendingAdvice { if let id = snapshot.locate(item.path) { ids.insert(id) } }
+        var ids = Set(removable.lazy.filter { !self.selection.protects(self.path(of: $0.node)) }.map(\.node))
+        for item in pendingAdvice where !selection.protects(canonicalPath(item.path)) {
+            if let id = snapshot.locate(item.path) { ids.insert(id) }
+        }
         return ids
     }
 
@@ -71,65 +90,115 @@ import SwiftUI
 
     func path(of node: Int) -> String { snapshot.displayPath(of: node) }
 
+    func canonicalPath(_ path: String) -> String {
+        let path = AdviceGuard.normalize(path)
+        return snapshot.locate(path).map { self.path(of: $0) } ?? path
+    }
+
     func update(snapshot: ScanSummary) {
+        analysis?.cancel()
         self.snapshot = snapshot
-        Task { await analyze() }
+        revision = UUID()
+        groups = []
+        stale = []
+        selected = []
+        staleSelected = []
+        analyzing = true
+        analyzed = false
+        refreshProtection()
+        candidatesChanged?()
+        analysis = Task { await analyze() }
     }
 
     func reloadAdvice() {
+        let previous = Set(pendingAdvice.map(\.id))
         advice = AdviceStore.load()
         let pending = Set(pendingAdvice.map(\.id))
         adviceSelected.formIntersection(pending)
-        for item in pendingAdvice where item.verdict == .safe { adviceSelected.insert(item.id) }
+        for item in pendingAdvice where item.verdict == .safe && !previous.contains(item.id) { adviceSelected.insert(item.id) }
+        refreshProtection()
         candidatesChanged?()
     }
 
+    private func refreshProtection() {
+        let kept = advice?.items.filter { !$0.isAction && !$0.path.isEmpty && ($0.status == .kept || $0.verdict == .keep) } ?? []
+        selection = CleanupSelection(kept: Set(kept.map { canonicalPath($0.path) }))
+    }
+
     func analyze() async {
+        guard !Task.isCancelled else { return }
         analyzing = true
         let snapshot = snapshot
-        let days = Double(days)
-        let minimum = minimum
-        async let groups = Task.detached(priority: .userInitiated) { CleanupAnalyzer.analyze(snapshot) }.value
-        async let stale = Task.detached(priority: .userInitiated) {
-            CloudOffload.staleFiles(in: snapshot, minSize: minimum, olderThanDays: days)
-        }.value
-        (self.groups, self.stale) = await (groups, stale)
+        let revision = revision
+        async let refreshStale: Void = findStale()
+        let groups = await Task.detached(priority: .userInitiated) { CleanupAnalyzer.analyze(snapshot) }.value
+        await refreshStale
+        guard revision == self.revision, !Task.isCancelled else { return }
+        self.groups = groups
         selected = Set(self.groups.filter { $0.category.safety == .safe && $0.category != CleanupCategories.trash }
-            .flatMap { $0.items.map(\.node) })
-        staleSelected = []
+            .flatMap { $0.items.lazy.filter { !self.selection.protects(self.path(of: $0.node)) }.map(\.node) })
         analyzing = false
         analyzed = true
         reloadAdvice()
     }
 
     func findStale() async {
+        guard !Task.isCancelled else { return }
+        let revision = revision
+        let request = UUID()
+        staleRevision = request
         let snapshot = snapshot
         let days = Double(days)
         let minimum = minimum
-        stale = await Task.detached(priority: .userInitiated) {
+        let files = await Task.detached(priority: .userInitiated) {
             CloudOffload.staleFiles(in: snapshot, minSize: minimum, olderThanDays: days)
         }.value
+        guard revision == self.revision, request == staleRevision, !Task.isCancelled else { return }
+        stale = files
         staleSelected = []
     }
 
     func keep(_ item: AdviceItem) {
-        try? AdviceStore.mark([item.id], as: .kept)
-        reloadAdvice()
+        do {
+            try AdviceStore.mark([item.id], as: .kept)
+            reloadAdvice()
+        } catch {
+            failures = [error.localizedDescription]
+        }
     }
 
-    func trashChosen() async {
-        let advised = chosenAdvice
-        let rules = chosenRules.map { URL(filePath: path(of: $0.node)) }
-        let urls = advised.map { URL(filePath: $0.path) } + rules
-        working = "Moving \(urls.count) items to the Trash…"
-        let outcome = await Task.detached(priority: .userInitiated) { AdviceTrash.move(urls) }.value
-        let trashed = Set(outcome.0.map(\.path))
-        try? AdviceStore.mark(Set(advised.filter { trashed.contains($0.path) }.map(\.id)), as: .trashed)
-        await finish(removed: outcome.0, refreshed: [], errors: outcome.1)
+    func prepareTrash(_ items: [CleanupSelection.Item]) -> TrashPlan {
+        var targets: [AdviceTrash.Target] = []
+        var missing: [String] = []
+        for item in items {
+            if let id = snapshot.locate(item.path) {
+                targets.append(AdviceTrash.Target(url: snapshot.url(for: id), node: snapshot.nodes[id]))
+            } else if let target = AdviceTrash.Target(url: URL(filePath: item.path)) {
+                targets.append(target)
+            } else {
+                missing.append("\(item.path): This item is no longer on disk.")
+            }
+        }
+        return TrashPlan(revision: revision, items: items, targets: targets, missing: missing)
+    }
+
+    func trashChosen(_ plan: TrashPlan) async {
+        reloadAdvice()
+        guard canWork, revision == plan.revision, chosen == plan.items else { return }
+        let advised = pendingAdvice.map { ($0.id, canonicalPath($0.path)) }
+        working = "Moving \(plan.targets.count) items to the Trash…"
+        let outcome = await Task.detached(priority: .userInitiated) { AdviceTrash.move(plan.targets) }.value
+        let trashed = outcome.done.map { AdviceGuard.normalize($0.source.path) }
+        try? AdviceStore.mark(Set(advised.filter { _, path in
+            trashed.contains { CleanupSelection.contains($0, path) }
+        }.map(\.0)), as: .trashed)
+        let refreshed = outcome.done.map { $0.destination?.deletingLastPathComponent() ?? snapshot.root }
+        await finish(removed: outcome.done.map(\.source), refreshed: refreshed, errors: plan.missing + outcome.errors)
     }
 
     func run(_ item: AdviceItem) async {
-        guard let action = item.action else { return }
+        guard canWork, let action = item.action,
+              advice?.items.contains(where: { $0.id == item.id && $0.isRunnable }) == true else { return }
         working = "Running \(item.title)…"
         let argument = item.argument
         let result = await Task.detached(priority: .userInitiated) { AdviceActions.perform(action, argument: argument) }.value
@@ -139,7 +208,7 @@ import SwiftUI
     }
 
     func moveChosen() async {
-        guard let destination else { return }
+        guard canWork, let destination else { return }
         let urls = chosenLocal.map { URL(filePath: $0.path) }
         working = "Moving \(urls.count) files to \(destination.title)…"
         let outcome = await Task.detached(priority: .userInitiated) { () -> ([URL], [String]) in
@@ -160,6 +229,7 @@ import SwiftUI
     }
 
     func removeDownloads() async {
+        guard canWork else { return }
         let urls = chosenInICloud.map { URL(filePath: $0.path) }
         working = "Removing \(urls.count) downloads…"
         let outcome = await Task.detached(priority: .userInitiated) { () -> ([URL], [String]) in
@@ -180,10 +250,10 @@ import SwiftUI
 
     private func finish(removed: [URL], refreshed: [URL], errors: [String]) async {
         working = "Updating the scan…"
-        if let updated = await apply(removed, refreshed) { snapshot = updated }
+        if let updated = await apply(removed, refreshed) { update(snapshot: updated) }
         working = nil
         failures = errors
-        await analyze()
+        reloadAdvice()
     }
 }
 
@@ -203,7 +273,7 @@ private struct VerdictLabel: View {
 struct CleanupPanel: View {
     @Bindable var model: CleanupModel
     @State private var focus: String?
-    @State private var confirmTrash = false
+    @State private var trashPlan: CleanupModel.TrashPlan?
     @State private var confirmMove = false
     @State private var confirmRun: AdviceItem?
 
@@ -252,10 +322,12 @@ struct CleanupPanel: View {
             Divider()
             footer.padding(12)
         }
-        .confirmationDialog("Move \(model.chosenCount) items to the Trash?", isPresented: $confirmTrash) {
-            Button("Move to Trash", role: .destructive) { Task { await model.trashChosen() } }
-        } message: {
-            Text("This frees \(formatSize(model.chosenSize)) once you empty the Trash. Items in the Trash can be put back.")
+        .confirmationDialog("Move \(trashPlan?.items.count ?? 0) items to the Trash?",
+                            isPresented: Binding { trashPlan != nil } set: { if !$0 { trashPlan = nil } },
+                            presenting: trashPlan) { plan in
+            Button("Move to Trash", role: .destructive) { Task { await model.trashChosen(plan) } }
+        } message: { plan in
+            Text("Estimated space after emptying the Trash: \(formatSize(plan.size)). Items in the Trash can be put back.")
         }
         .confirmationDialog("Move \(model.chosenLocal.count) files to \(model.destination?.title ?? "the cloud")?", isPresented: $confirmMove) {
             Button("Move") { Task { await model.moveChosen() } }
@@ -371,6 +443,7 @@ struct CleanupPanel: View {
     }
 
     @ViewBuilder private var footer: some View {
+        let chosen = model.chosen
         VStack(alignment: .leading, spacing: 8) {
             if let working = model.working {
                 HStack(spacing: 8) {
@@ -386,12 +459,12 @@ struct CleanupPanel: View {
                 }
             }
             HStack {
-                Text("\(model.chosenCount) selected · \(formatSize(model.chosenSize))")
+                Text("\(chosen.count) selected · \(formatSize(chosen.reduce(0) { $0 + $1.size }))")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                 Spacer()
-                Button("Move to Trash…", role: .destructive) { confirmTrash = true }
-                    .disabled(model.chosenCount == 0 || model.working != nil)
+                Button("Move to Trash…", role: .destructive) { trashPlan = model.prepareTrash(chosen) }
+                    .disabled(chosen.isEmpty || !model.canWork)
             }
         }
     }
@@ -441,13 +514,15 @@ private struct AdviceRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 14)
             } else if item.status == .pending && item.verdict != .keep {
+                let protected = model.selection.protects(model.canonicalPath(item.path))
                 Toggle(model.display(item.path), isOn: Binding {
-                    model.adviceSelected.contains(item.id)
+                    !protected && model.adviceSelected.contains(item.id)
                 } set: { on in
                     if on { model.adviceSelected.insert(item.id) } else { model.adviceSelected.remove(item.id) }
                 })
                 .toggleStyle(.checkbox)
                 .labelsHidden()
+                .disabled(protected)
             } else {
                 Image(systemName: item.verdict == .keep ? "lock" : "checkmark")
                     .foregroundStyle(.secondary)
@@ -488,7 +563,7 @@ private struct AdviceRow: View {
                     if item.isRunnable {
                         Button(item.action == "empty-trash" ? "Empty Trash…" : "Run…") { run(item) }
                             .controlSize(.small)
-                            .disabled(model.working != nil)
+                            .disabled(!model.canWork)
                             .padding(.top, 2)
                     }
                 }
@@ -510,32 +585,34 @@ private struct AdviceRow: View {
 private struct CategoryRow: View {
     @Bindable var model: CleanupModel
     let group: CleanupGroup
+    @State private var showAll = false
 
     private var isTrash: Bool { group.category == CleanupCategories.trash }
 
     private var allSelected: Binding<Bool> {
-        Binding {
-            group.items.allSatisfy { model.selected.contains($0.node) }
+        let eligible = group.items.lazy.map(\.node).filter { !model.selection.protects(model.path(of: $0)) }
+        return Binding {
+            !eligible.isEmpty && eligible.allSatisfy(model.selected.contains)
         } set: { on in
-            for item in group.items {
-                if on { model.selected.insert(item.node) } else { model.selected.remove(item.node) }
-            }
+            if on { model.selected.formUnion(eligible) } else { model.selected.subtract(eligible) }
         }
     }
 
     var body: some View {
         DisclosureGroup {
-            ForEach(group.items.prefix(300), id: \.node) { item in
+            ForEach(group.items.prefix(showAll ? group.items.count : 300), id: \.node) { item in
                 let path = model.path(of: item.node)
+                let protected = model.selection.protects(path)
                 HStack {
                     if !isTrash {
                         Toggle(model.display(path), isOn: Binding {
-                            model.selected.contains(item.node)
+                            !protected && model.selected.contains(item.node)
                         } set: { on in
                             if on { model.selected.insert(item.node) } else { model.selected.remove(item.node) }
                         })
                         .toggleStyle(.checkbox)
                         .labelsHidden()
+                        .disabled(protected)
                     }
                     Text(model.display(path)).lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 4)
@@ -544,8 +621,8 @@ private struct CategoryRow: View {
                 .tag(path)
                 .contextMenu { ItemMenu(model: model, path: path) }
             }
-            if group.items.count > 300 {
-                Text("\(group.items.count - 300) more").foregroundStyle(.secondary)
+            if !showAll, group.items.count > 300 {
+                Button("Show all \(group.items.count.formatted()) items") { showAll = true }
             }
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 8) {

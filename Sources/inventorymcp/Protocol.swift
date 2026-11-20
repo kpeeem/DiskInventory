@@ -53,12 +53,16 @@ struct Params {
 
     func integer(_ key: String) throws -> Int? {
         guard let value = try number(key) else { return nil }
-        return Int(value)
+        if let text = string(key), let integer = Int(text) { return integer }
+        guard let integer = Int(exactly: value.rounded(.towardZero)) else {
+            throw ToolFailure("\(key) is outside the supported integer range")
+        }
+        return integer
     }
 
     func seconds(_ key: String, fallback: Double, limit: Double) throws -> Double {
         guard let value = try number(key) else { return fallback }
-        guard value > 0 else { throw ToolFailure("\(key) must be greater than zero") }
+        guard value.isFinite, value > 0 else { throw ToolFailure("\(key) must be a finite number greater than zero") }
         return min(value, limit)
     }
 

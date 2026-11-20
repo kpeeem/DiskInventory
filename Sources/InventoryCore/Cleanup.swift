@@ -34,6 +34,54 @@ public struct CleanupGroup: Sendable {
     public var size: Int64 { items.reduce(0) { $0 + $1.size } }
 }
 
+public struct CleanupSelection {
+    public struct Item: Equatable, Sendable {
+        public let path: String
+        public let size: Int64
+
+        public init(path: String, size: Int64) {
+            self.path = path
+            self.size = size
+        }
+    }
+
+    private let kept: Set<String>
+    private let containsKept: Set<String>
+
+    public init(kept: Set<String>) {
+        self.kept = kept
+        containsKept = Set(kept.flatMap(Self.ancestors))
+    }
+
+    public func protects(_ path: String) -> Bool {
+        !kept.isEmpty && (kept.contains(path) || containsKept.contains(path) || Self.ancestors(path).contains(where: kept.contains))
+    }
+
+    public func collapse(_ items: [Item]) -> [Item] {
+        let eligible = items.filter { !protects($0.path) }
+        let paths = Set(eligible.map(\.path))
+        var seen = Set<String>()
+        return eligible.filter { item in
+            seen.insert(item.path).inserted && !Self.ancestors(item.path).contains(where: paths.contains)
+        }
+    }
+
+    public static func contains(_ ancestor: String, _ path: String) -> Bool {
+        path == ancestor || path.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+    }
+
+    private static func ancestors(_ path: String) -> [String] {
+        guard path != "/" else { return [] }
+        var parents: [String] = []
+        var rest = path[...]
+        while let slash = rest.lastIndex(of: "/") {
+            rest = rest[..<slash]
+            parents.append(rest.isEmpty ? "/" : String(rest))
+        }
+        return parents
+    }
+}
+
 public enum CleanupCategories {
     public static let trash = CleanupCategory(
         id: "trash", title: "Trash",
@@ -49,7 +97,7 @@ public enum CleanupCategories {
         explanation: "Xcode rebuilds them the next time a simulator starts.", safety: .safe)
     public static let systemCaches = CleanupCategory(
         id: "system-caches", title: "System Caches and Logs",
-        explanation: "Shared caches and logs in /Library, rebuilt by the apps that wrote them; Finder asks for an administrator password for items the system owns.", safety: .regenerable)
+        explanation: "Shared caches and logs in /Library, rebuilt by the apps that wrote them. Items you lack permission to move stay in place.", safety: .regenerable)
     public static let derivedData = CleanupCategory(
         id: "derived-data", title: "Xcode DerivedData",
         explanation: "Intermediate build files; Xcode builds the project again, which takes time.", safety: .regenerable)
@@ -129,7 +177,6 @@ public enum CleanupAnalyzer {
         NameRule(name: ".build", siblings: ["Package.swift"], inside: [], category: CleanupCategories.buildArtifacts),
         NameRule(name: "target", siblings: ["Cargo.toml"], inside: [], category: CleanupCategories.buildArtifacts),
         NameRule(name: "Pods", siblings: ["Podfile"], inside: [], category: CleanupCategories.buildArtifacts),
-        NameRule(name: "DerivedData", siblings: [], inside: [], category: CleanupCategories.buildArtifacts),
         NameRule(name: ".gradle", siblings: ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"], inside: [], category: CleanupCategories.buildArtifacts),
         NameRule(name: ".next", siblings: ["package.json"], inside: [], category: CleanupCategories.buildArtifacts),
         NameRule(name: ".turbo", siblings: ["package.json"], inside: [], category: CleanupCategories.buildArtifacts),
@@ -277,7 +324,21 @@ public enum CloudOffload {
         var result: [StaleFile] = []
         for folder in folders {
             let folderPath = homePath + "/" + folder
-            guard let folderID = snapshot.locate(folderPath) else { continue }
+            let rootPath = snapshot.displayPath(of: 0)
+            let scope: String
+            let folderID: Int
+            if let id = snapshot.locate(folderPath) {
+                scope = folderPath
+                folderID = id
+            } else if rootPath.hasPrefix(folderPath + "/") {
+                let relative = rootPath.dropFirst(folderPath.count + 1)
+                guard !relative.split(separator: "/").contains(where: { $0.hasPrefix(".") }),
+                      !snapshot.kinds[Int(snapshot.nodes[0].kind)].isPackage else { continue }
+                scope = rootPath
+                folderID = 0
+            } else {
+                continue
+            }
             var files: [Int] = []
             var stack = [folderID]
             while let id = stack.popLast() {
@@ -291,7 +352,7 @@ public enum CloudOffload {
                 }
             }
             guard !files.isEmpty else { continue }
-            let indexed = spotlightDates(in: folderPath, minSize: minSize)
+            let indexed = spotlightDates(in: scope, minSize: minSize)
             for id in files {
                 let path = snapshot.displayPath(of: id)
                 let dates = indexed[path] ?? fileDates(path)
@@ -416,13 +477,18 @@ public extension ScanSummary {
 
     func heldByClones() -> [Int: Int64] {
         var families: [Inode: [Int]] = [:]
-        for id in nodes.indices where nodes[id].references > 1 {
+        for id in nodes.indices where nodes[id].isShared {
             families[Inode(device: nodes[id].device, number: nodes[id].shared), default: []].append(id)
         }
         var held: [Int: Int64] = [:]
         for members in families.values {
             guard let owner = members.first(where: { nodes[$0].allocated > 0 }) else { continue }
-            let stop = members.count >= Int(nodes[owner].references) ? commonAncestor(of: members) : -1
+            let copies = Dictionary(grouping: members, by: { nodes[$0].inode })
+            let allCopies = copies.count >= Int(nodes[owner].references)
+            let allLinks = copies.values.allSatisfy { ids in
+                ids.count >= Int(ids.map { nodes[$0].hardLinks }.max() ?? 0)
+            }
+            let stop = allCopies && allLinks ? commonAncestor(of: members) : -1
             var node = owner
             while node >= 0, node != stop {
                 held[node, default: 0] += nodes[owner].allocated

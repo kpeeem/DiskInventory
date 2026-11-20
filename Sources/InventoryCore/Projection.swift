@@ -20,6 +20,44 @@ public enum SearchField: String, CaseIterable, Sendable {
     case all = "All", name = "Name", kind = "Kind", path = "Path"
 }
 
+private struct LimitedResults<Entry> {
+    let limit: Int
+    let before: (Entry, Entry) -> Bool
+    private var heap: [Entry] = []
+
+    init(limit: Int, before: @escaping (Entry, Entry) -> Bool) {
+        self.limit = limit
+        self.before = before
+    }
+
+    mutating func insert(_ entry: Entry) {
+        guard limit > 0 else { return }
+        if heap.count < limit {
+            var child = heap.count
+            heap.append(entry)
+            while child > 0 {
+                let parent = (child - 1) / 2
+                guard before(heap[parent], heap[child]) else { break }
+                heap.swapAt(parent, child)
+                child = parent
+            }
+        } else if before(entry, heap[0]) {
+            heap[0] = entry
+            var parent = 0
+            while 2 * parent + 1 < heap.count {
+                let left = 2 * parent + 1
+                let right = left + 1
+                let worst = right < heap.count && before(heap[left], heap[right]) ? right : left
+                guard before(heap[parent], heap[worst]) else { break }
+                heap.swapAt(parent, worst)
+                parent = worst
+            }
+        }
+    }
+
+    func sorted() -> [Entry] { heap.sorted(by: before) }
+}
+
 public extension ScanSummary {
     func isExpandable(_ id: Int, options: ViewOptions) -> Bool {
         nodes[id].isDirectory && (id == 0 || options.packages || !kinds[Int(nodes[id].kind)].isPackage)
@@ -50,9 +88,24 @@ public extension ScanSummary {
         }
     }
 
+    func largestChildren(of id: Int, mode: SizeMode, limit: Int) -> (count: Int, ids: [Int]) {
+        var best = LimitedResults<(id: Int, size: Int64, order: Int)>(limit: limit) {
+            $0.size == $1.size ? $0.order < $1.order : $0.size > $1.size
+        }
+        var count = 0
+        var child = nodes[id].firstChild
+        while child >= 0 {
+            let node = nodes[Int(child)]
+            best.insert((Int(child), node.size(mode), count))
+            count += 1
+            child = node.nextSibling
+        }
+        return (count, best.sorted().map(\.id))
+    }
+
     func kindTotals(options: ViewOptions) throws -> [KindTotal] {
         var totals = kinds.indices.map { KindTotal(kind: $0) }
-        try visitFiles(options: options) { _, node in
+        try visitFiles(options: options) { _, node, _ in
             let kind = Int(node.kind)
             totals[kind].size += node.size(options.mode)
             totals[kind].count += 1
@@ -63,17 +116,26 @@ public extension ScanSummary {
     }
 
     func search(_ query: String, field: SearchField, kind: Int?, options: ViewOptions) throws -> [Int] {
+        try search(query, field: field, kind: kind, options: options, limit: nil).ids
+    }
+
+    func search(_ query: String, field: SearchField, kind: Int?, options: ViewOptions, limit: Int?) throws -> (count: Int, ids: [Int]) {
+        let before: (Int, Int) -> Bool = { searchSortsBefore($0, $1, mode: options.mode) }
+        var best = limit.map { LimitedResults<Int>(limit: $0, before: before) }
         var matches: [Int] = []
-        try visitFiles(options: options) { id, node in
+        var count = 0
+        let needsPath = !query.isEmpty && (field == .all || field == .path)
+        try visitFiles(options: options, includePath: needsPath) { id, node, parentPath in
             if let kind, Int(node.kind) != kind { return }
             if query.isEmpty
                 || ((field == .all || field == .name) && node.name.localizedStandardContains(query))
                 || ((field == .all || field == .kind) && kinds[Int(node.kind)].title.localizedStandardContains(query))
-                || ((field == .all || field == .path) && url(for: id).path.localizedStandardContains(query)) {
-                matches.append(id)
+                || (needsPath && (parentPath + node.name).localizedStandardContains(query)) {
+                count += 1
+                if best != nil { best?.insert(id) } else { matches.append(id) }
             }
         }
-        return matches.sorted { searchSortsBefore($0, $1, mode: options.mode) }
+        return (count, best?.sorted() ?? matches.sorted(by: before))
     }
 
     func searchSortsBefore(_ first: Int, _ second: Int, mode: SizeMode) -> Bool {
@@ -82,23 +144,32 @@ public extension ScanSummary {
         return a == b ? first < second : a > b
     }
 
-    private func visitFiles(options: ViewOptions, _ body: (Int, FileNode) -> Void) throws {
+    private func visitFiles(
+        options: ViewOptions, includePath: Bool = false, _ body: (Int, FileNode, String) -> Void
+    ) throws {
         var id: Int32 = nodes[0].firstChild
         var visited = 0
+        var directories: [String] = []
+        if includePath {
+            let path = root.path
+            directories.append(path == "/" ? "/" : path + "/")
+        }
         while id >= 0 {
             if visited.isMultiple(of: 1024) { try Task.checkCancellation() }
             visited += 1
             let item = nodes[Int(id)]
             if isExpandable(Int(id), options: options) {
                 if item.firstChild >= 0 {
+                    if includePath { directories.append((directories.last ?? "") + item.name + "/") }
                     id = item.firstChild
                     continue
                 }
             } else {
-                body(Int(id), item)
+                body(Int(id), item, directories.last ?? "")
             }
             while id > 0, nodes[Int(id)].nextSibling < 0 {
                 id = nodes[Int(id)].parent
+                if includePath, id > 0 { directories.removeLast() }
             }
             id = id > 0 ? nodes[Int(id)].nextSibling : -1
         }

@@ -61,7 +61,7 @@ private struct PlaceholderView: View {
 
 @MainActor final class TreemapView: NSView {
     var choose: ((Int, Bool) -> Void)?
-    var zoomAggregate: ((Int) -> Void)?
+    var zoomAggregate: ((Int, Int?) -> Void)?
     var hover: ((Int?) -> Void)?
     var context: ((Int) -> NSMenu?)?
     var quickLook: (() -> Void)?
@@ -276,7 +276,12 @@ private struct PlaceholderView: View {
         guard let tile = tile(at: event) else { return }
         window?.makeFirstResponder(self)
         if tile.aggregate {
-            if event.clickCount == 2 { zoomAggregate?(tile.id) }
+            if event.clickCount == 2, let snapshot {
+                let visible = Set(tiles.lazy.filter { !$0.aggregate }.map(\.id))
+                var child = snapshot.nodes[tile.id].firstChild
+                while child >= 0, visible.contains(Int(child)) { child = snapshot.nodes[Int(child)].nextSibling }
+                zoomAggregate?(tile.id, child >= 0 ? Int(child) : nil)
+            }
         } else {
             choose?(tile.id, event.clickCount == 2)
         }

@@ -232,7 +232,7 @@ import SwiftUI
                   let task = trash(url, parent: parent, node: node, id: id) else {
                 throw CocoaError(.fileWriteUnknown)
             }
-            guard let resultingURL = try await task.value else { throw CocoaError(.fileWriteUnknown) }
+            guard let resultingURL = try await task.value.destination else { throw CocoaError(.fileWriteUnknown) }
             let updated = await waitUntil {
                 !self.isTrashing && self.scanWorker == nil && self.snapshot?.find(url) == nil && self.map.hasTiles
             }
@@ -415,9 +415,15 @@ import SwiftUI
         map.quickLook = { [weak self] in self?.toggleQuickLook() }
         map.zoomOutRequest = { [weak self] in self?.zoomOut() }
         map.placeholderAction = { [weak self] in self?.placeholderAction?() }
-        map.zoomAggregate = { [weak self] id in
-            guard let self, id != zoom else { return }
-            zoomTo(id: id)
+        map.zoomAggregate = { [weak self] id, child in
+            guard let self else { return }
+            if id != zoom {
+                zoomTo(id: id)
+            } else {
+                fileAndMap.splitViewItems.first?.isCollapsed = false
+                if let child { select(child) }
+                self.window?.makeFirstResponder(files.view)
+            }
         }
         map.hover = { [weak self] id in self?.showInfo(id ?? self?.selected) }
         map.context = { [weak self] id in self?.contextMenu(id) }
@@ -451,13 +457,17 @@ import SwiftUI
         let model = CleanupModel(snapshot: snapshot) { [weak self] removed, refreshed in
             await self?.applyCleanup(removed: removed, refreshed: refreshed)
         }
+        model.scanIsIdle = { [weak self] in
+            guard let self else { return false }
+            return scanWorker == nil && !isTrashing && !closed
+        }
         model.reveal = { [weak self] path in self?.revealPath(path) }
         model.quickLook = { [weak self] path in self?.preview(path) }
         model.candidatesChanged = { [weak self] in self?.updateMapEmphasis() }
         model.scanHome = { NSApp.sendAction(#selector(ApplicationController.scanHome), to: nil, from: nil) }
         cleanupModel = model
         details.showCleanup(AnyView(CleanupPanel(model: model)))
-        Task { await model.analyze() }
+        model.update(snapshot: snapshot)
     }
 
     func reloadAdvice() {
@@ -550,8 +560,9 @@ import SwiftUI
         lastProgress.at.duration(to: .now) > .seconds(seconds)
     }
 
-    func scan(restore: Bool = true, refreshing id: Int? = nil, afterTrash: Bool = false) {
-        guard !closed, !isTrashing else { return }
+    func scan(restore: Bool = true, refreshing id: Int? = nil, trashMove: AdviceTrash.Move? = nil) {
+        guard !closed, !isTrashing, cleanupModel?.working == nil else { return }
+        let afterTrash = trashMove != nil
         if id == nil, !afterTrash, askForAccess(then: { [weak self] in self?.scan(restore: restore) }) { return }
         let oldSnapshot = snapshot
         let selectedURL = rescanningSelection ?? selected.flatMap { $0 >= 0 ? oldSnapshot?.url(for: $0) : nil }
@@ -583,8 +594,9 @@ import SwiftUI
             defer { continuation.finish() }
             let summary: ScanSummary
             if let id, let oldSnapshot {
-                summary = if afterTrash {
-                    try InventoryScanner.removing(id, from: oldSnapshot)
+                summary = if let trashMove {
+                    try InventoryScanner.updating(oldSnapshot, removed: [trashMove.source],
+                        refreshing: [trashMove.destination?.deletingLastPathComponent() ?? oldSnapshot.root])
                 } else {
                     try InventoryScanner.refresh(id, in: oldSnapshot) { continuation.yield($0) }
                 }
@@ -1063,7 +1075,8 @@ import SwiftUI
     }
 
     @objc func moveToTrash() {
-        guard let snapshot, let id = selected, id > 0, let window, !isTrashing, scanWorker == nil else { return }
+        guard let snapshot, let id = selected, id > 0, let window, !isTrashing, scanWorker == nil,
+              cleanupModel?.working == nil else { return }
         let node = snapshot.nodes[id]
         let url = snapshot.url(for: id)
         let parent = snapshot.url(for: Int(node.parent))
@@ -1096,14 +1109,7 @@ import SwiftUI
         progress.startAnimation(nil)
         window?.toolbar?.validateVisibleItems()
         let result = await Task.detached(priority: .userInitiated) { () throws -> ScanSummary in
-            var summary = current
-            for url in removed {
-                if let id = summary.locate(url.path), id > 0 { summary = try InventoryScanner.removing(id, from: summary) }
-            }
-            for url in refreshed {
-                if let id = summary.locate(url.path), id > 0 { summary = try InventoryScanner.refresh(id, in: summary) }
-            }
-            return summary
+            try InventoryScanner.updating(current, removed: removed, refreshing: refreshed)
         }.result
         isTrashing = false
         progress.stopAnimation(nil)
@@ -1126,8 +1132,8 @@ import SwiftUI
     }
 
     @discardableResult
-    private func trash(_ url: URL, parent: URL, node: FileNode, id: Int) -> Task<URL?, Error>? {
-        guard !closed, !isTrashing, scanWorker == nil else { return nil }
+    private func trash(_ url: URL, parent: URL, node: FileNode, id: Int) -> Task<AdviceTrash.Move, Error>? {
+        guard !closed, !isTrashing, scanWorker == nil, cleanupModel?.working == nil else { return nil }
         guard let snapshot, snapshot.nodes.indices.contains(id),
               snapshot.nodes[id].inode == node.inode, snapshot.nodes[id].device == node.device,
               snapshot.url(for: id).path == url.path else {
@@ -1141,17 +1147,7 @@ import SwiftUI
         window?.toolbar?.validateVisibleItems()
 
         let worker = Task.detached(priority: .userInitiated) {
-            var data = stat()
-            let status = url.withUnsafeFileSystemRepresentation { path in
-                path.map { lstat($0, &data) } ?? -1
-            }
-            guard status == 0, data.st_dev == node.device, data.st_ino == node.inode,
-                  parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else {
-                throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "This item changed since the scan. Refresh before moving it to Trash."])
-            }
-            var resultingURL: NSURL?
-            try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
-            return resultingURL as URL?
+            try AdviceTrash.move(AdviceTrash.Target(url: url, node: node))
         }
         Task { [weak self] in
             let result = await worker.result
@@ -1159,9 +1155,9 @@ import SwiftUI
             isTrashing = false
             window?.toolbar?.validateVisibleItems()
             switch result {
-            case .success:
+            case let .success(move):
                 rescanningSelection = parent
-                scan(refreshing: id, afterTrash: true)
+                scan(refreshing: id, trashMove: move)
             case let .failure(error):
                 progress.stopAnimation(nil)
                 updateStatus()

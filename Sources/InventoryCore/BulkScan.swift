@@ -11,6 +11,7 @@ enum BulkScan {
         let regular: Bool
         let shared: UInt64
         let references: UInt32
+        let hardLinks: UInt16
         let logical: Int64
         let allocated: Int64
 
@@ -23,6 +24,7 @@ enum BulkScan {
             regular = type == S_IFREG
             shared = regular && info.st_nlink > 1 ? info.st_ino : 0
             references = 0
+            hardLinks = regular && info.st_nlink > 1 ? info.st_nlink : 0
             logical = directory ? 0 : max(0, info.st_size)
             allocated = directory ? 0 : max(0, info.st_blocks) * 512
         }
@@ -37,6 +39,7 @@ enum BulkScan {
             let cloned = regular && cloneReferences > 1 && clone != 0
             shared = cloned ? clone | 1 << 63 : regular && links > 1 ? inode : 0
             references = cloned ? cloneReferences : 0
+            hardLinks = regular && links > 1 ? UInt16(clamping: links) : 0
             self.logical = max(0, logical)
             self.allocated = max(0, allocated)
         }
@@ -53,6 +56,26 @@ enum BulkScan {
             let value = bytes.loadUnaligned(fromByteOffset: offset, as: type)
             offset += MemoryLayout<T>.size
             return value
+        }
+    }
+
+    static func cloneInfo(at url: URL) -> (shared: UInt64, references: UInt32)? {
+        var attributes = attrlist()
+        attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        attributes.commonattr = ATTR_CMN_RETURNED_ATTRS
+        let requested = UInt32(ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT)
+        attributes.forkattr = requested
+        let options = UInt32(FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED)
+        return withUnsafeTemporaryAllocation(byteCount: 64, alignment: 8) { buffer in
+            let status = url.withUnsafeFileSystemRepresentation { path in
+                path.map { getattrlist($0, &attributes, buffer.baseAddress, buffer.count, options) } ?? -1
+            }
+            guard status == 0 else { return nil }
+            var record = Record(bytes: UnsafeRawBufferPointer(buffer), offset: MemoryLayout<UInt32>.size)
+            guard let returned = try? record.take(attribute_set_t.self), returned.forkattr & requested == requested,
+                  let clone = try? record.take(UInt64.self), clone != 0,
+                  let references = try? record.take(UInt32.self), references > 1 else { return nil }
+            return (clone | 1 << 63, references)
         }
     }
 
@@ -223,10 +246,11 @@ enum BulkScan {
         DispatchQueue.concurrentPerform(iterations: coordinator.workers) { _ in
             let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: 256 * 1024, alignment: 8)
             defer { buffer.deallocate() }
+            var catalog = KindCatalog()
             while let index = coordinator.next() {
                 coordinator.finish(index, with: Result {
                     try scanUnit(index, coordinator: coordinator, device: rootInfo.st_dev,
-                                 ignoreCreatorCode: ignoreCreatorCode, buffer: buffer)
+                                 ignoreCreatorCode: ignoreCreatorCode, buffer: buffer, catalog: &catalog)
                 })
             }
         }
@@ -236,10 +260,9 @@ enum BulkScan {
 
     private static func scanUnit(
         _ index: Int, coordinator: Coordinator, device rootDevice: Int32, ignoreCreatorCode: Bool,
-        buffer: UnsafeMutableRawBufferPointer
+        buffer: UnsafeMutableRawBufferPointer, catalog: inout KindCatalog
     ) throws -> Partial {
         let unit = coordinator.unit(index)
-        var catalog = KindCatalog()
         var issues: [ScanIssue] = []
         var issueCount = 0
         var dataless = Set<Int>()
@@ -395,7 +418,7 @@ enum BulkScan {
                     }
                     nodes.append(FileNode(
                         name: name, parent: Int32(parent), kind: kind, device: metadata.device, references: metadata.references, inode: metadata.inode,
-                        isDirectory: metadata.directory, nextSibling: nodes[parent].firstChild,
+                        isDirectory: metadata.directory, hardLinks: metadata.hardLinks, nextSibling: nodes[parent].firstChild,
                         logical: metadata.logical, allocated: metadata.allocated,
                         rawAllocated: metadata.allocated, shared: metadata.shared, fileCount: metadata.directory ? 0 : 1
                     ))

@@ -37,16 +37,18 @@ func sizeArgument(_ params: Params, _ key: String, fallback: Int64) throws -> In
         ("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10),
         ("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10), ("B", 1),
     ]
-    for (suffix, factor) in units where normalized.hasSuffix(suffix) {
-        guard let value = Double(normalized.dropLast(suffix.count)), value >= 0 else {
-            throw ToolFailure("\(key): \(text) is not a size; use bytes or a suffix such as 500M or 2G")
-        }
-        return Int64(value * Double(factor))
+    let unit = units.first { normalized.hasSuffix($0.0) }
+    let digits = normalized.dropLast(unit?.0.count ?? 0)
+    let factor = unit?.1 ?? 1
+    if let integer = Int64(digits), integer >= 0 {
+        let (bytes, overflow) = integer.multipliedReportingOverflow(by: factor)
+        if !overflow { return bytes }
     }
-    guard let value = Double(normalized), value >= 0 else {
-        throw ToolFailure("\(key): \(text) is not a size; use bytes or a suffix such as 500M or 2G")
+    guard let value = Double(digits), value >= 0,
+          let bytes = Int64(exactly: (value * Double(factor)).rounded(.towardZero)) else {
+        throw ToolFailure("\(key) must be a size in range; use bytes or a suffix such as 500M or 2G")
     }
-    return Int64(value)
+    return bytes
 }
 
 func hasFullDiskAccess() -> Bool {
@@ -63,6 +65,10 @@ struct StoredScan {
     let seconds: Double
     let finishedAt: Date
     let held: [Int: Int64]
+
+    func isFresh(at date: Date, maxAge: Double) -> Bool {
+        date.timeIntervalSince(finishedAt) <= maxAge
+    }
 
     var summary: [String: Any] {
         let root = snapshot.nodes[0]
@@ -84,55 +90,128 @@ struct StoredScan {
 }
 
 final class ScanStore {
-    private let lock = NSLock()
-    private var scans: [String: StoredScan] = [:]
+    static let defaultMaxAge: Double = 1800
+    static let retention: Double = 86_400
 
-    func cached(path: String, finderKinds: Bool, maxAge: Double) -> StoredScan? {
-        lock.withLock {
-            guard let scan = scans[path], scan.finderKinds == finderKinds || !finderKinds,
-                  Date().timeIntervalSince(scan.finishedAt) <= maxAge else { return nil }
-            return scan
+    private struct Key: Hashable {
+        let path: String
+        let finderKinds: Bool
+    }
+
+    private final class Job {
+        let finished = DispatchGroup()
+        var task: Task<Void, Never>?
+        var result: Result<StoredScan, Error>?
+        var waiters = 0
+
+        init() { finished.enter() }
+    }
+
+    private let lock = NSLock()
+    private var scans: [Key: StoredScan] = [:]
+    private var jobs: [Key: Job] = [:]
+    private let snapshotLimit = 4
+    private let nodeLimit = 4_000_000
+    private let eviction = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+
+    init() {
+        eviction.schedule(deadline: .now() + .seconds(60), repeating: .seconds(60))
+        eviction.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lock.withLock { self.prune(at: .now) }
+        }
+        eviction.resume()
+    }
+
+    deinit { eviction.cancel() }
+
+    func scan(path: String, finderKinds: Bool, refresh: Bool, maxAge: Double, timeout: Double) throws -> StoredScan {
+        let key = Key(path: path, finderKinds: finderKinds)
+        let detailed = Key(path: path, finderKinds: true)
+        let deadline = DispatchTime.now() + timeout
+        let (cached, job): (StoredScan?, Job?) = lock.withLock {
+            let now = Date()
+            prune(at: now)
+            if !refresh,
+               let cached = [scans[key], scans[detailed]].compactMap({ $0 })
+                   .filter({ $0.isFresh(at: now, maxAge: maxAge) }).max(by: { $0.finishedAt < $1.finishedAt }) {
+                return (cached, nil)
+            }
+            if let job = jobs[key] ?? jobs[detailed] {
+                guard job.waiters > 0 else { return (nil, nil) }
+                job.waiters += 1
+                return (nil, job)
+            }
+            let job = Job()
+            job.waiters = 1
+            jobs[key] = job
+            job.task = Task.detached(priority: .userInitiated) {
+                let started = ContinuousClock.now
+                let result = Result {
+                    let snapshot = try InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory),
+                                                             ignoreCreatorCode: !finderKinds)
+                    let held = snapshot.heldByClones()
+                    let duration = started.duration(to: .now).components
+                    return StoredScan(snapshot: snapshot, path: path, finderKinds: finderKinds,
+                                      seconds: Double(duration.seconds) + Double(duration.attoseconds) / 1e18,
+                                      finishedAt: .now, held: held)
+                }
+                self.lock.withLock {
+                    if job.waiters > 0, case let .success(scan) = result {
+                        self.cache(scan, for: key)
+                    }
+                    job.result = result
+                    job.task = nil
+                    self.jobs.removeValue(forKey: key)
+                    job.finished.leave()
+                }
+            }
+            return (nil, job)
+        }
+        if let cached { return cached }
+        guard let job else { throw ToolFailure("the previous scan of \(path) is still stopping; retry shortly") }
+        let completed = job.finished.wait(timeout: deadline) == .success
+        return try lock.withLock {
+            job.waiters -= 1
+            if completed, let result = job.result { return try result.get() }
+            if job.waiters == 0 { job.task?.cancel() }
+            throw ToolFailure("the scan of \(path) was still running after \(timeout) s; raise max_seconds or scan a smaller folder")
         }
     }
 
-    func store(_ scan: StoredScan) {
-        lock.withLock { scans[scan.path] = scan }
+    private func prune(at date: Date) {
+        scans = scans.filter { $0.value.isFresh(at: date, maxAge: Self.retention) }
     }
 
-    var all: [StoredScan] {
-        lock.withLock { scans.values.sorted { $0.finishedAt > $1.finishedAt } }
+    private func cache(_ scan: StoredScan, for key: Key) {
+        scans.removeValue(forKey: key)
+        guard scan.snapshot.nodes.count <= nodeLimit else { return }
+        prune(at: scan.finishedAt)
+        scans[key] = scan
+        var nodes = scans.values.reduce(0) { $0 + $1.snapshot.nodes.count }
+        for (oldest, value) in scans.sorted(by: { $0.value.finishedAt < $1.value.finishedAt }) {
+            if scans.count <= snapshotLimit, nodes <= nodeLimit { break }
+            scans.removeValue(forKey: oldest)
+            nodes -= value.snapshot.nodes.count
+        }
     }
-}
 
-private final class ScanOutcome: @unchecked Sendable {
-    var result: Result<ScanSummary, Error>?
+    func recent(maxAge: Double = retention) -> [StoredScan] {
+        lock.withLock {
+            let now = Date()
+            prune(at: now)
+            return scans.values.filter { $0.isFresh(at: now, maxAge: maxAge) }.sorted { $0.finishedAt > $1.finishedAt }
+        }
+    }
 }
 
 func scanArguments(_ params: Params, store: ScanStore, defaultPath: String = "~") throws -> StoredScan {
     let path = resolvePath(params.string("path") ?? defaultPath)
     let finderKinds = try params.flag("finder_kinds", fallback: false)
-    let maxAge = try params.seconds("max_age_seconds", fallback: 1800, limit: 86_400)
-    if try !params.flag("refresh", fallback: false), let cached = store.cached(path: path, finderKinds: finderKinds, maxAge: maxAge) {
-        return cached
-    }
+    let maxAge = try params.seconds("max_age_seconds", fallback: ScanStore.defaultMaxAge, limit: ScanStore.retention)
+    let refresh = try params.flag("refresh", fallback: false)
     let maxSeconds = try params.seconds("max_seconds", fallback: 120, limit: 1800)
-    let started = Date()
-    let outcome = ScanOutcome()
-    let finished = DispatchSemaphore(value: 0)
-    let task = Task.detached(priority: .userInitiated) {
-        outcome.result = Result { try InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory), ignoreCreatorCode: !finderKinds) }
-        finished.signal()
-    }
-    if finished.wait(timeout: .now() + maxSeconds) == .timedOut {
-        task.cancel()
-        finished.wait()
-        throw ToolFailure("the scan of \(path) was still running after \(Int(maxSeconds)) s; raise max_seconds or scan a smaller folder")
-    }
-    let snapshot = try outcome.result!.get()
-    let scan = StoredScan(snapshot: snapshot, path: path, finderKinds: finderKinds,
-                          seconds: Date().timeIntervalSince(started), finishedAt: Date(), held: snapshot.heldByClones())
-    store.store(scan)
-    return scan
+    return try store.scan(path: path, finderKinds: finderKinds, refresh: refresh, maxAge: maxAge, timeout: maxSeconds)
 }
 
 let scanProperties: [String: Any] = [
@@ -211,14 +290,10 @@ private let formatterISO: ISO8601DateFormatter = {
 
 
 func adviceSize(_ path: String, store: ScanStore) -> Int64 {
-    for scan in store.all {
+    for scan in store.recent(maxAge: ScanStore.defaultMaxAge) {
         if let id = scan.snapshot.locate(path) { return scan.snapshot.reclaimable(id, held: scan.held) }
     }
-    var info = stat()
-    guard lstat(path, &info) == 0 else { return 0 }
-    guard info.st_mode & S_IFMT == S_IFDIR else { return Int64(info.st_blocks) * 512 }
-    guard let scanned = try? InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory)) else { return 0 }
-    return scanned.reclaimable(0, held: scanned.heldByClones())
+    return InventoryScanner.reclaimableSize(at: URL(filePath: path))
 }
 
 func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
@@ -274,7 +349,7 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             [
                 "full_disk_access": hasFullDiskAccess(),
                 "cloud_destinations": CloudOffload.destinations().map { ["service": $0.service.rawValue, "title": $0.title, "root": $0.root.path] },
-                "scans_in_memory": store.all.map(\.summary),
+                "scans_in_memory": store.recent().map(\.summary),
             ]
         },
 
@@ -285,14 +360,14 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                 "limit": Schema.integer("top-level items to list (default 12)"),
             ]))
         ) { params in
-            let scan = try scanArguments(params, store: store)
             let limit = try params.count("limit", fallback: 12, limit: 100)
+            let scan = try scanArguments(params, store: store)
             let snapshot = scan.snapshot
             let total = snapshot.nodes[0].allocated
-            let children = snapshot.children(of: 0).sorted { snapshot.nodes[$0].allocated > snapshot.nodes[$1].allocated }
+            let children = snapshot.largestChildren(of: 0, mode: .allocated, limit: limit)
             return [
                 "scan": scan.summary,
-                "top": children.prefix(limit).map { entryJSON(scan, $0, mode: .allocated, total: total) },
+                "top": children.ids.map { entryJSON(scan, $0, mode: .allocated, total: total) },
                 "skipped_examples": snapshot.issues.prefix(15).map { ["path": $0.path, "reason": $0.message] },
             ]
         },
@@ -306,17 +381,17 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                 "mode": Schema.choice("size on disk or logical size (default allocated)", ["allocated", "logical"]),
             ]))
         ) { params in
+            let limit = try params.count("limit", fallback: 25, limit: 500)
             let scan = try scanArguments(params, store: store)
             let snapshot = scan.snapshot
             let id = try focus(params, in: scan)
             let mode = try sizeMode(params)
-            let limit = try params.count("limit", fallback: 25, limit: 500)
             let total = snapshot.nodes[id].size(mode)
-            let children = snapshot.children(of: id).sorted { snapshot.nodes[$0].size(mode) > snapshot.nodes[$1].size(mode) }
+            let children = snapshot.largestChildren(of: id, mode: mode, limit: limit)
             return [
                 "folder": entryJSON(scan, id, mode: mode, total: total),
                 "count": children.count,
-                "items": children.prefix(limit).map { entryJSON(scan, $0, mode: mode, total: total) },
+                "items": children.ids.map { entryJSON(scan, $0, mode: mode, total: total) },
             ]
         },
 
@@ -390,10 +465,12 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             Schema.object(withScanProperties([
                 "query": Schema.text("text to look for"),
                 "field": Schema.choice("where to look (default all)", ["all", "name", "kind", "path"]),
+                "packages": Schema.boolean("search inside app bundles and other packages (default true)"),
                 "limit": Schema.integer("matches to return (default 30, max 500)"),
                 "mode": Schema.choice("size on disk or logical size (default allocated)", ["allocated", "logical"]),
             ]), required: ["query"])
         ) { params in
+            let limit = try params.count("limit", fallback: 30, limit: 500)
             let scan = try scanArguments(params, store: store)
             let snapshot = scan.snapshot
             let query = try params.requiredString("query")
@@ -405,10 +482,10 @@ func makeTools(_ store: ScanStore) -> [Tool] {
             }
             var options = ViewOptions()
             options.mode = try sizeMode(params)
-            let limit = try params.count("limit", fallback: 30, limit: 500)
-            let matches = try snapshot.search(query, field: field, kind: nil, options: options)
+            options.packages = try params.flag("packages", fallback: true)
+            let matches = try snapshot.search(query, field: field, kind: nil, options: options, limit: limit)
             let total = snapshot.nodes[0].size(options.mode)
-            return ["found": matches.count, "items": matches.prefix(limit).map { entryJSON(scan, $0, mode: options.mode, total: total) }]
+            return ["found": matches.count, "items": matches.ids.map { entryJSON(scan, $0, mode: options.mode, total: total) }]
         },
 
         syncTool(
@@ -456,10 +533,10 @@ func makeTools(_ store: ScanStore) -> [Tool] {
                 "limit": Schema.integer("files to return (default 30, max 500)"),
             ]))
         ) { params in
-            let scan = try scanArguments(params, store: store)
             let days = min(max(try params.number("days") ?? 180, 1), 3650)
             let minSize = try sizeArgument(params, "min_size", fallback: 100 << 20)
             let limit = try params.count("limit", fallback: 30, limit: 500)
+            let scan = try scanArguments(params, store: store)
             let stale = CloudOffload.staleFiles(in: scan.snapshot, minSize: minSize, olderThanDays: days)
             let total = stale.reduce(Int64(0)) { $0 + $1.size }
             let inICloud = stale.filter(\.isInICloud).reduce(Int64(0)) { $0 + $1.size }

@@ -67,6 +67,51 @@ import Testing
     #expect(deleted.nodes[0].fileCount == 2)
 }
 
+@Test func pathLookupUsesTheVolumesCaseRules() throws {
+    let base = ProcessInfo.processInfo.environment["DISK_INVENTORY_TEST_VOLUME"]
+        .map { URL(filePath: $0, directoryHint: .isDirectory) } ?? FileManager.default.temporaryDirectory
+    let root = base.appending(path: "Lookup-" + UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let nested = root.appending(path: "folder/Nested", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    let file = nested.appending(path: "sample")
+    try Data([1]).write(to: file)
+    let alternate = root.appending(path: "Folder/nested/Sample")
+    let snapshot = try InventoryScanner.scan(root)
+    let id = try #require(snapshot.find(file))
+    let supportsCase = try root.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]).volumeSupportsCaseSensitiveNames
+    #expect(snapshot.find(alternate) == (supportsCase == true ? nil : id))
+}
+
+@Test func limitedResultsPreserveFullOrderingAndCounts() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? fm.removeItem(at: root) }
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    for index in 0..<17 {
+        try Data(repeating: 42, count: index % 4 * 1000 + 1).write(to: root.appending(path: "item-\(index).bin"))
+    }
+    let directory = root.appending(path: "Outer Folder/deep", directoryHint: .isDirectory)
+    try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+    let inside = directory.appending(path: "file % café.bin")
+    try Data([3]).write(to: inside)
+    try Data([3]).write(to: root.appending(path: "outside.bin"))
+    let snapshot = try InventoryScanner.scan(root)
+    var options = ViewOptions()
+    options.mode = .logical
+    let children = snapshot.children(of: 0).sorted { snapshot.nodes[$0].logical > snapshot.nodes[$1].logical }
+    let all = try snapshot.search(".bin", field: .name, kind: nil, options: options)
+    for limit in [1, 2, 5, 50] {
+        let leading = snapshot.largestChildren(of: 0, mode: .logical, limit: limit)
+        let matches = try snapshot.search(".bin", field: .name, kind: nil, options: options, limit: limit)
+        #expect(leading.count == children.count && leading.ids == Array(children.prefix(limit)))
+        #expect(matches.count == all.count && matches.ids == Array(all.prefix(limit)))
+    }
+    let id = try #require(snapshot.find(inside))
+    #expect(try snapshot.search("Folder/deep/file % cafe", field: .path, kind: nil, options: options) == [id])
+    #expect(try snapshot.search("Folder/deep/file % cafe", field: .all, kind: nil, options: options) == [id])
+}
+
 @Test func bulkMetadataMatchesFTS() throws {
     let fm = FileManager.default
     let root = fm.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)

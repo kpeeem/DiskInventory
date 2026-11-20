@@ -30,6 +30,8 @@ private func temporaryHome() throws -> URL {
     try makeFile(home.appending(path: "Dev/loose/node_modules/dep/index.js"))
     try makeFile(home.appending(path: "Dev/crate/Cargo.toml"))
     try makeFile(home.appending(path: "Dev/crate/target/debug/app"))
+    try makeFile(home.appending(path: "Documents/DerivedData/family.txt"))
+    try makeFile(home.appending(path: "Library/Developer/Xcode/DerivedData/Project/index"))
     try makeFile(home.appending(path: ".vscode/extensions/ext/package.json"))
     try makeFile(home.appending(path: ".vscode/extensions/ext/node_modules/dep/index.js"))
     try makeFile(home.appending(path: "Downloads/Installer.dmg"))
@@ -43,6 +45,7 @@ private func temporaryHome() throws -> URL {
 
     #expect(found["caches"] == ["Library/Caches/com.example.app"])
     #expect(found["build-artifacts"] == ["Dev/web/node_modules", "Dev/crate/target"])
+    #expect(found["derived-data"] == ["Library/Developer/Xcode/DerivedData/Project"])
     #expect(found["installers"] == ["Downloads/Installer.dmg"])
     #expect(groups.first?.category.safety == .safe)
     let project = try InventoryScanner.scan(home.appending(path: "Dev"))
@@ -61,11 +64,55 @@ private func temporaryHome() throws -> URL {
     try makeFile(home.appending(path: "Movies/tiny-old.mov"), bytes: 4_096, age: 400)
     try makeFile(home.appending(path: "Pictures/Library.photoslibrary/database.db"), bytes: 65_536, age: 400)
     try makeFile(home.appending(path: "Dev/old-build.bin"), bytes: 65_536, age: 400)
+    let download = home.appending(path: "Downloads/archive/old.zip")
+    try makeFile(download, bytes: 65_536, age: 500)
 
     let snapshot = try InventoryScanner.scan(home)
     let stale = CloudOffload.staleFiles(in: snapshot, minSize: 32_768, olderThanDays: 180, home: home)
-    #expect(stale.map { URL(filePath: $0.path).lastPathComponent } == ["old.mov"])
+    #expect(Set(stale.map { URL(filePath: $0.path).lastPathComponent }) == ["old.mov", "old.zip"])
     #expect(try #require(stale.first?.lastActivity) < Date(timeIntervalSinceNow: -300 * 86_400))
+    let archive = try InventoryScanner.scan(download.deletingLastPathComponent())
+    #expect(CloudOffload.staleFiles(in: archive, minSize: 32_768, olderThanDays: 180, home: home).map(\.path) == [download.path])
+}
+
+@Test func cleanupCollapsesOverlapsAndRespectsKeep() {
+    let parent = CleanupSelection.Item(path: "/test/cache", size: 12)
+    let advised = CleanupSelection.Item(path: "/test/cache/data", size: 8)
+    let other = CleanupSelection.Item(path: "/test/cache-old", size: 5)
+    #expect(CleanupSelection(kept: []).collapse([advised, parent, advised, other]) == [parent, other])
+    #expect(CleanupSelection(kept: [advised.path]).collapse([advised, parent, advised, other]) == [other])
+    #expect(CleanupSelection(kept: [parent.path]).collapse([advised, other]) == [other])
+}
+
+@Test func cleanupRefusesAReplacementAtTheScannedPath() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let item = root.appending(path: "cache")
+    try makeFile(item)
+    let snapshot = try InventoryScanner.scan(root)
+    let node = snapshot.nodes[try #require(snapshot.find(item))]
+    try FileManager.default.moveItem(at: item, to: root.appending(path: "old-cache"))
+    try makeFile(item)
+    let target = AdviceTrash.Target(url: item, node: node)
+    #expect(throws: CocoaError.self) { try AdviceTrash.move(target) }
+    #expect(FileManager.default.fileExists(atPath: item.path))
+}
+
+@Test func cleanupDoesNotCountHardLinksOutsideTheScan() throws {
+    let home = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let cache = home.appending(path: "Library/Caches/app")
+    let file = cache.appending(path: "blob")
+    try makeFile(file, bytes: 4 << 20)
+    try FileManager.default.linkItem(at: file, to: home.appending(path: "second-link"))
+    for preferBulk in [true, false] {
+        let snapshot = try InventoryScanner.scan(cache, preferBulk: preferBulk)
+        #expect(snapshot.nodes[0].allocated == 4 << 20)
+        #expect(snapshot.reclaimable(0, held: snapshot.heldByClones()) == 0)
+    }
+    let whole = try InventoryScanner.scan(home)
+    #expect(whole.reclaimable(0, held: whole.heldByClones()) == 4 << 20)
+    #expect(InventoryScanner.reclaimableSize(at: file) == 0)
 }
 
 @Test func cloudDestinationsAndMoves() throws {
@@ -119,7 +166,7 @@ private func temporaryHome() throws -> URL {
 @Test func adviceActionsOnlyRunFromTheAllowlist() {
     #expect(AdviceActions.refusal("rm-rf", argument: "/") != nil)
     #expect(AdviceActions.refusal("simctl-delete-device", argument: nil) != nil)
-    #expect(AdviceActions.refusal("simctl-delete-device", argument: "not-a-simulator") != nil)
+    #expect(AdviceActions.refusal("simctl-delete-device", argument: "not-a-simulator") == "invalid simulator UUID")
     #expect(AdviceActions.refusal("brew-uninstall-cask", argument: "x; rm -rf ~") != nil)
     #expect(AdviceActions.refusal("empty-trash", argument: nil) == nil)
     #expect(AdviceActions.definition("simctl-delete-device")?.commandLine("ABC") == "/usr/bin/xcrun simctl delete ABC")
@@ -130,6 +177,17 @@ private func temporaryHome() throws -> URL {
     #expect(item.isRunnable && !item.isRemovable)
     item.status = .done
     #expect(!item.isRunnable)
+}
+
+@Test func commandsHaveBoundedTimeAndOutput() {
+    let ordinary = AdviceActions.run("/usr/bin/printf", ["sample"])
+    #expect(ordinary.status == 0 && ordinary.output == "sample")
+    let deadline = ContinuousClock.now
+    let slow = AdviceActions.run("/bin/sleep", ["10"], timeout: 0.05)
+    #expect(slow.status != 0 && slow.output.contains("timed out"))
+    #expect(deadline.duration(to: .now) < .seconds(2))
+    let tooMuch = AdviceActions.run("/usr/bin/printf", ["123456"], outputLimit: 5)
+    #expect(tooMuch.status != 0 && tooMuch.output.contains("output limit"))
 }
 
 @Test func vendorFoldersInLibraryAreReviewOnly() throws {
@@ -167,4 +225,28 @@ private func temporaryHome() throws -> URL {
         .first { snapshot.nodes[$0].allocated > 0 })
     let after = try InventoryScanner.removing(owner, from: snapshot)
     #expect(after.nodes[0].allocated == total)
+
+    let unchanged = try InventoryScanner.refresh(owner, in: snapshot)
+    #expect(unchanged.nodes[0].allocated == total)
+}
+
+@Test func movingInsideScanUpdatesTheSourceAndDestination() throws {
+    let root = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let file = root.appending(path: "file")
+    let unrelated = root.appending(path: "extra")
+    let folder = root.appending(path: ".Trash")
+    let dest = folder.appending(path: "file")
+    try makeFile(file, bytes: 4 << 20)
+    try makeFile(unrelated)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let initial = try InventoryScanner.scan(root)
+    try FileManager.default.moveItem(at: file, to: dest)
+    try FileManager.default.removeItem(at: unrelated)
+    let updated = try InventoryScanner.updating(initial, removed: [file, unrelated], refreshing: [folder])
+    let full = try InventoryScanner.scan(root)
+    #expect(updated.find(file) == nil && updated.find(unrelated) == nil)
+    #expect(updated.find(dest) != nil)
+    #expect(updated.nodes[0].allocated == full.nodes[0].allocated)
+    #expect(updated.nodes[0].fileCount == full.nodes[0].fileCount)
 }

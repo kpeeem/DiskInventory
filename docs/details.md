@@ -11,7 +11,7 @@ English · [Русский](details.ru.md)
 | **Worth a Look** | installers in Downloads and on the Desktop, local AI models, simulator devices, Xcode archives, iPhone backups |
 | **Not Opened Lately** | big files in Desktop, Documents, Downloads, Movies, Music, Pictures and iCloud Drive untouched for 3 months to 2 years; move them to iCloud Drive or Google Drive (“Archived from Mac”) or drop the local copy of iCloud files |
 
-Build artifacts are not searched inside `~/Library`, hidden folders of the home folder and app bundles. Items owned by the system go to the Trash through Finder, which asks for an administrator password.
+Build artifacts are not searched inside `~/Library`, hidden folders of the home folder and app bundles. Items the app lacks permission to move stay in place and appear under Details.
 
 ## Advice outside the home folder
 
@@ -38,7 +38,7 @@ On APFS the walk is parallel: a shared folder queue, attributes read in batches 
 |---|---|
 | `inventory_scan` | full scan of a folder or volume (`/System/Volumes/Data` for the boot volume), kept for 30 minutes |
 | `inventory_children`, `inventory_top` | walk level by level; biggest files or folders anywhere below |
-| `inventory_kinds`, `inventory_search` | space by file kind; search by name, kind or path |
+| `inventory_kinds`, `inventory_search` | space by file kind and search by name, kind or path. Search includes package contents by default. Set `packages: false` to treat packages as a single item. |
 | `inventory_cleanup`, `inventory_stale` | the Clean Up rules; files not opened for months and cloud folders to move them to |
 | `inventory_system` | what takes space outside the home folder, and the allowed actions |
 | `inventory_advise`, `inventory_advice`, `inventory_advice_clear`, `inventory_show_cleanup` | send advice to the app, read what the user did, clear it, open the tab |

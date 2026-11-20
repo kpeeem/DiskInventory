@@ -45,7 +45,7 @@ public struct AdviceItem: Codable, Identifiable, Hashable, Sendable {
     public var title: String { label ?? URL(filePath: path).lastPathComponent }
 }
 
-public struct AdviceSheet: Codable, Sendable {
+public struct AdviceSheet: Codable, Equatable, Sendable {
     public var title: String
     public var summary: String
     public var author: String
@@ -98,11 +98,14 @@ public enum AdviceStore {
             flock(lock, LOCK_UN)
             close(lock)
         }
-        var sheet = load()
+        let previous = load()
+        var sheet = previous
         try change(&sheet)
-        if var sheet {
-            sheet.updatedAt = .now
-            try encoder.encode(sheet).write(to: file, options: .atomic)
+        guard sheet != previous else { return previous }
+        if var updated = sheet {
+            updated.updatedAt = .now
+            try encoder.encode(updated).write(to: file, options: .atomic)
+            sheet = updated
         } else if FileManager.default.fileExists(atPath: file.path) {
             try FileManager.default.removeItem(at: file)
         }
@@ -111,6 +114,7 @@ public enum AdviceStore {
     }
 
     public static func mark(_ ids: Set<UUID>, as status: AdviceStatus, output: String? = nil) throws {
+        guard !ids.isEmpty else { return }
         try update { sheet in
             guard var current = sheet else { return }
             for index in current.items.indices where ids.contains(current.items[index].id) {
@@ -275,7 +279,8 @@ public enum AdviceActions {
             explanation: "xcrun simctl delete removes the simulator and the apps installed in it.",
             command: { argument in argument.map { ("/usr/bin/xcrun", ["simctl", "delete", $0]) } },
             validate: { argument in
-                guard let argument, simulators().contains(where: { $0.udid == argument }) else { return "no such simulator" }
+                guard let argument, UUID(uuidString: argument) != nil else { return "invalid simulator UUID" }
+                guard simulators().contains(where: { $0.udid == argument }) else { return "no such simulator" }
                 return nil
             },
             estimate: { argument in argument.map { folderSize(simulatorFolder($0)) } ?? 0 }),
@@ -328,31 +333,117 @@ public enum AdviceActions {
 
     public static func perform(_ id: String, argument: String?) -> (ok: Bool, output: String) {
         guard let definition = definition(id) else { return (false, "unknown action") }
-        if let refusal = definition.validate(argument) { return (false, refusal) }
+        if let refusal = refusal(id, argument: argument) { return (false, refusal) }
         if id == "empty-trash" {
             let failure = AdviceTrash.emptyTrash()
             return (failure == nil, failure ?? "The Trash is empty")
         }
         guard let command = definition.command(argument) else { return (false, "the tool is not available") }
-        let result = run(command.tool, command.arguments)
+        let result = run(command.tool, command.arguments, timeout: 300)
         return (result.status == 0, result.output)
     }
 
-    public static func run(_ tool: String, _ arguments: [String]) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(filePath: tool)
-        process.arguments = arguments
+    public static func run(
+        _ tool: String, _ arguments: [String], timeout: Double = 30, outputLimit: Int = 8 << 20
+    ) -> (status: Int32, output: String) {
+        guard timeout.isFinite, timeout > 0, timeout <= 3600, outputLimit > 0 else {
+            return (-1, "Invalid command limits")
+        }
+        var descriptors: [Int32] = [-1, -1]
+        guard pipe(&descriptors) == 0 else { return (-1, String(cString: strerror(errno))) }
+        let reader = descriptors[0]
+        let writer = descriptors[1]
+        defer { close(reader) }
+        guard fcntl(reader, F_SETFD, FD_CLOEXEC) == 0,
+              fcntl(writer, F_SETFD, FD_CLOEXEC) == 0,
+              fcntl(reader, F_SETFL, O_NONBLOCK) == 0 else {
+            let error = errno
+            close(writer)
+            return (-1, String(cString: strerror(error)))
+        }
+        var actions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        let actionError = posix_spawn_file_actions_init(&actions)
+        defer { if actions != nil { posix_spawn_file_actions_destroy(&actions) } }
+        let attrError = posix_spawnattr_init(&attributes)
+        defer { if attributes != nil { posix_spawnattr_destroy(&attributes) } }
+        guard actionError == 0, attrError == 0 else {
+            close(writer)
+            return (-1, String(cString: strerror(actionError == 0 ? attrError : actionError)))
+        }
+        let setupError = [
+            posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0),
+            posix_spawn_file_actions_adddup2(&actions, writer, STDOUT_FILENO),
+            posix_spawn_file_actions_adddup2(&actions, writer, STDERR_FILENO),
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)),
+            posix_spawnattr_setpgroup(&attributes, 0),
+        ].first { $0 != 0 }
+        if let setupError {
+            close(writer)
+            return (-1, String(cString: strerror(setupError)))
+        }
         var environment = ProcessInfo.processInfo.environment
         environment["HOMEBREW_NO_AUTO_UPDATE"] = "1"
         environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do { try process.run() } catch { return (-1, error.localizedDescription) }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        var argv = ([tool] + arguments).map { strdup($0) } + [nil]
+        var env = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            argv.forEach { free($0) }
+            env.forEach { free($0) }
+        }
+        guard !argv.dropLast().contains(nil), !env.dropLast().contains(nil) else {
+            close(writer)
+            return (-1, String(cString: strerror(ENOMEM)))
+        }
+        var pid: pid_t = 0
+        let launched = posix_spawn(&pid, tool, &actions, &attributes, &argv, &env)
+        close(writer)
+        guard launched == 0 else { return (-1, String(cString: strerror(launched))) }
+
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 16 << 10)
+        var status: Int32 = 0
+        var exited = false
+        defer {
+            if !exited {
+                kill(-pid, SIGKILL)
+                let child = pid
+                let waited = waitpid(child, &status, WNOHANG)
+                if waited == 0 || (waited < 0 && errno == EINTR) {
+                    DispatchQueue.global(qos: .utility).async {
+                        var status: Int32 = 0
+                        while waitpid(child, &status, 0) < 0 && errno == EINTR {}
+                    }
+                }
+            }
+        }
+        while ContinuousClock.now < deadline, !Task.isCancelled {
+            let count = read(reader, &buffer, buffer.count)
+            if count > 0 {
+                guard count <= outputLimit - data.count else {
+                    return (-1, "Command exceeded its output limit")
+                }
+                data.append(contentsOf: buffer.prefix(count))
+                continue
+            }
+            if !exited {
+                let waited = waitpid(pid, &status, WNOHANG)
+                if waited < 0 && errno != EINTR { return (-1, String(cString: strerror(errno))) }
+                exited = waited == pid
+            }
+            if exited {
+                let code = status & 0x7f == 0 ? (status >> 8) & 0xff : -1
+                return (code, String(decoding: data, as: UTF8.self))
+            }
+            if count == 0 {
+                usleep(10_000)
+            } else {
+                var ready = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
+                poll(&ready, 1, 10)
+            }
+        }
+        return (-1, Task.isCancelled ? "Command cancelled" : "Command timed out after \(timeout) s")
     }
 
     public struct Simulator: Sendable {
@@ -425,41 +516,67 @@ public enum AdviceActions {
         case "T": 1e12
         default: 1
         }
-        return Int64(value * factor)
+        guard value >= 0 else { return 0 }
+        return Int64(exactly: (value * factor).rounded(.towardZero)) ?? 0
     }
 }
 
 public enum AdviceTrash {
-    public static func move(_ urls: [URL]) -> (done: [URL], errors: [String]) {
-        var done: [URL] = []
-        var errors: [String] = []
-        var denied: [URL] = []
-        for url in urls {
-            do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-                done.append(url)
-            } catch let error as CocoaError where error.code == .fileWriteNoPermission || error.code == .fileReadNoPermission {
-                denied.append(url)
-            } catch {
-                errors.append("\(url.path): \(error.localizedDescription)")
-            }
+    public struct Target: Sendable {
+        public let url: URL
+        let device: Int32
+        let inode: UInt64
+
+        public init(url: URL, node: FileNode) {
+            self.url = url
+            device = node.device
+            inode = node.inode
         }
-        guard !denied.isEmpty else { return (done, errors) }
-        let files = denied.map { "POSIX file \"\(escape($0.path))\" as alias" }.joined(separator: ", ")
-        if let failure = finder("delete {\(files)}") {
-            errors += denied.map { "\($0.path): \(failure)" }
-        } else {
-            done += denied
+
+        public init?(url: URL) {
+            var info = stat()
+            guard lstat(url.path, &info) == 0 else { return nil }
+            self.url = url
+            device = info.st_dev
+            inode = info.st_ino
+        }
+    }
+
+    public struct Move: Sendable {
+        public let source: URL
+        public let destination: URL?
+    }
+
+    public static func move(_ target: Target) throws -> Move {
+        let url = target.url
+        let parent = url.deletingLastPathComponent().standardizedFileURL
+        var info = stat()
+        guard lstat(url.path, &info) == 0, info.st_dev == target.device, info.st_ino == target.inode,
+              parent.resolvingSymlinksInPath().pathComponents == parent.pathComponents else {
+            throw CocoaError(.fileNoSuchFile, userInfo: [
+                NSLocalizedDescriptionKey: "This item changed since it was selected. Refresh before moving it to Trash."
+            ])
+        }
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        return Move(source: url, destination: resultingURL as URL?)
+    }
+
+    public static func move(_ targets: [Target]) -> (done: [Move], errors: [String]) {
+        var done: [Move] = []
+        var errors: [String] = []
+        for target in targets {
+            do {
+                done.append(try move(target))
+            } catch {
+                errors.append("\(target.url.path): \(error.localizedDescription)")
+            }
         }
         return (done, errors)
     }
 
     public static func emptyTrash() -> String? {
         finder("empty trash")
-    }
-
-    private static func escape(_ text: String) -> String {
-        text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     private static func finder(_ command: String) -> String? {

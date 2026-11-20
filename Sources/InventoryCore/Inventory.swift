@@ -20,6 +20,7 @@ public struct FileNode: Sendable {
     var references: UInt32 = 0
     public let inode: UInt64
     public let isDirectory: Bool
+    var hardLinks: UInt16 = 0
     public var firstChild: Int32 = -1
     public var nextSibling: Int32 = -1
     public var logical: Int64
@@ -107,13 +108,32 @@ public struct ScanSummary: Sendable {
 
     public func find(_ url: URL) -> Int? {
         let base = root.pathComponents
-        let target = url.standardizedFileURL.pathComponents
-        guard target.starts(with: base) else { return nil }
+        let targetURL = url.standardizedFileURL
+        let target = targetURL.pathComponents
+        guard target.count >= base.count else { return nil }
+        if !target.starts(with: base) {
+            let prefix = NSString.path(withComponents: Array(target.prefix(base.count)))
+            var info = stat()
+            guard lstat(prefix, &info) == 0, info.st_dev == nodes[0].device, info.st_ino == nodes[0].inode else { return nil }
+        }
         var node = 0
-        for component in target.dropFirst(base.count) {
+        for index in base.count..<target.count {
+            let component = target[index]
             var child = nodes[node].firstChild
-            while child >= 0, nodes[Int(child)].name != component {
+            while child >= 0, !nodes[Int(child)].name.utf8.elementsEqual(component.utf8) {
                 child = nodes[Int(child)].nextSibling
+            }
+            if child < 0 {
+                let prefix = NSString.path(withComponents: Array(target.prefix(index + 1)))
+                var info = stat()
+                guard lstat(prefix, &info) == 0 else { return nil }
+                child = nodes[node].firstChild
+                while child >= 0 {
+                    let candidate = nodes[Int(child)]
+                    if candidate.device == info.st_dev, candidate.inode == info.st_ino,
+                       candidate.name.compare(component, options: .caseInsensitive) == .orderedSame { break }
+                    child = candidate.nextSibling
+                }
             }
             guard child >= 0 else { return nil }
             node = Int(child)
@@ -369,7 +389,7 @@ public enum InventoryScanner {
             let regular = attributes.st_mode & S_IFMT == S_IFREG
             let displayName = level == 0 && root.lastPathComponent.isEmpty ? "/" : name ?? root.lastPathComponent
             let kind: Int32
-            if !ignoreCreatorCode, !symlink, level > 0 {
+            if !ignoreCreatorCode, !symlink, level > 0 || !directoryOnly {
                 let finder = FinderInfo.read(entry.pointee.fts_path)
                 kind = catalog.finderKind(name: displayName, directory: directory, mode: UInt32(attributes.st_mode),
                                           info: finder, path: String(cString: entry.pointee.fts_path))
@@ -380,13 +400,16 @@ public enum InventoryScanner {
             let identity = Inode(device: attributes.st_dev, number: attributes.st_ino)
             let isHardLink = regular && attributes.st_nlink > 1
             let countBlocks = !isHardLink || links.insert(identity).inserted
+            let clone = !directoryOnly && preferBulk && level == 0 && regular ? BulkScan.cloneInfo(at: root) : nil
             let logical = directory ? 0 : max(0, attributes.st_size)
             let rawAllocated = directory ? 0 : max(0, attributes.st_blocks) * 512
             let allocated = countBlocks ? rawAllocated : 0
             var node = FileNode(
-                name: displayName, parent: Int32(parent), kind: kind, device: attributes.st_dev, inode: attributes.st_ino,
-                isDirectory: directory, logical: logical, allocated: allocated,
-                rawAllocated: rawAllocated, shared: isHardLink ? attributes.st_ino : 0, fileCount: directory ? 0 : 1
+                name: displayName, parent: Int32(parent), kind: kind, device: attributes.st_dev,
+                references: clone?.references ?? 0, inode: attributes.st_ino,
+                isDirectory: directory, hardLinks: isHardLink ? attributes.st_nlink : 0,
+                logical: logical, allocated: allocated, rawAllocated: rawAllocated,
+                shared: clone?.shared ?? (isHardLink ? attributes.st_ino : 0), fileCount: directory ? 0 : 1
             )
             if parent >= 0 {
                 node.nextSibling = nodes[parent].firstChild
@@ -444,7 +467,7 @@ public enum InventoryScanner {
         guard id > 0, previous.nodes.indices.contains(id) else { return previous }
         let item = previous.nodes[id]
         guard !item.isDirectory, !item.isShared else {
-            return try replacing(id, in: previous, with: nil)
+            return try rebuilding(previous, removing: [id])
         }
         try Task.checkCancellation()
         let parent = Int(item.parent)
@@ -479,7 +502,64 @@ public enum InventoryScanner {
                            traversal: previous.traversal)
     }
 
+    public static func removing(_ ids: Set<Int>, from previous: ScanSummary) throws -> ScanSummary {
+        let valid = ids.filter { $0 > 0 && previous.nodes.indices.contains($0) && previous.nodes[$0].parent >= 0 }
+        if valid.isEmpty { return previous }
+        if valid.count == 1, let id = valid.first { return try removing(id, from: previous) }
+        return try rebuilding(previous, removing: valid)
+    }
+
+    public static func updating(_ previous: ScanSummary, removed: [URL], refreshing: [URL]) throws -> ScanSummary {
+        var parents = Set<String>()
+        for url in refreshing {
+            var folder = url.standardizedFileURL
+            while previous.locate(folder.path) == nil, folder.path != "/" {
+                folder.deleteLastPathComponent()
+            }
+            if let id = previous.locate(folder.path) {
+                if id == 0 { return try refresh(0, in: previous) }
+                parents.insert(previous.url(for: id).path)
+            }
+        }
+        var ids = Set<Int>()
+        for (parent, urls) in Dictionary(grouping: removed, by: { $0.deletingLastPathComponent().path }) {
+            guard let id = previous.locate(parent) else { continue }
+            var names = Set(urls.map(\.lastPathComponent))
+            for child in previous.children(of: id) where names.remove(previous.nodes[child].name) != nil {
+                ids.insert(child)
+            }
+            for name in names {
+                if let child = previous.locate(URL(filePath: parent).appending(path: name).path) { ids.insert(child) }
+            }
+        }
+        var result = try removing(ids, from: previous)
+        for path in parents.sorted() {
+            guard !parents.contains(where: { $0 != path && CleanupSelection.contains($0, path) }),
+                  let id = result.locate(path) else { continue }
+            result = try refresh(id, in: result)
+        }
+        return result
+    }
+
+    public static func reclaimableSize(at url: URL) -> Int64 {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return 0 }
+        if info.st_mode & S_IFMT == S_IFDIR {
+            guard let snapshot = try? scan(url) else { return 0 }
+            return snapshot.reclaimable(0, held: snapshot.heldByClones())
+        }
+        if info.st_mode & S_IFMT == S_IFREG, info.st_nlink > 1 || BulkScan.cloneInfo(at: url) != nil { return 0 }
+        return max(0, info.st_blocks) * 512
+    }
+
     private static func replacing(_ id: Int, in previous: ScanSummary, with replacement: ScanSummary?) throws -> ScanSummary {
+        try rebuilding(previous, removing: [id], inserting: replacement.map { (id, $0) })
+    }
+
+    private static func rebuilding(
+        _ previous: ScanSummary, removing removed: Set<Int>, inserting insertion: (id: Int, scan: ScanSummary)? = nil
+    ) throws -> ScanSummary {
+        let replacement = insertion?.scan
         var kinds = previous.kinds
         var kindIndex = Dictionary(uniqueKeysWithValues: kinds.enumerated().map { ($1, Int32($0)) })
         let newKinds = (replacement?.kinds ?? []).map { kind in
@@ -511,9 +591,10 @@ public enum InventoryScanner {
             if item.nextSibling >= 0, !entry.replacement || entry.source != 0 {
                 work.append(Entry(source: Int(item.nextSibling), parent: entry.parent, replacement: entry.replacement))
             }
-            if !entry.replacement, entry.source == id {
-                guard replacement != nil else { continue }
-                work.append(Entry(source: 0, parent: entry.parent, replacement: true))
+            if !entry.replacement, removed.contains(entry.source) {
+                if entry.source == insertion?.id {
+                    work.append(Entry(source: 0, parent: entry.parent, replacement: true))
+                }
                 continue
             }
             guard nodes.count < Int32.max else { throw ScanError.tooManyEntries }
@@ -550,8 +631,10 @@ public enum InventoryScanner {
                 nodes[Int(parent)].fileCount += nodes[i].fileCount
             }
         }
-        let path = previous.url(for: id).path
-        let outside = previous.issues.filter { $0.path != path && !$0.path.hasPrefix(path + "/") }
+        let paths = previous.issues.isEmpty ? [] : removed.map { previous.url(for: $0).path }
+        let outside = previous.issues.filter { issue in
+            !paths.contains { issue.path == $0 || issue.path.hasPrefix($0 + "/") }
+        }
         let issueCount = previous.issueCount - (previous.issues.count - outside.count) + (replacement?.issueCount ?? 0)
         let issues = outside + (replacement?.issues ?? [])
         let volume = previous.volume == nil ? nil : VolumeUsage.read(previous.root)
