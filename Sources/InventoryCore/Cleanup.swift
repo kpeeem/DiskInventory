@@ -470,8 +470,14 @@ public enum CloudOffload {
         let text = "kMDItemPhysicalSize >= \(minSize)" as CFString
         guard let query = MDQueryCreate(kCFAllocatorDefault, text, attributes as CFArray, nil) else { return [:] }
         MDQuerySetSearchScope(query, [scope] as CFArray, 0)
-        guard MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue)) else { return [:] }
-        MDQueryStop(query)
+        guard !Task.isCancelled, MDQueryExecute(query, 0) else { return [:] }
+        defer { MDQueryStop(query) }
+        // Spotlight delivers results on this thread's run loop. Keep cancellation observable while gathering.
+        while !MDQueryIsGatheringComplete(query) {
+            guard !Task.isCancelled else { return [:] }
+            let state = CFRunLoopRunInMode(.defaultMode, 0.05, true)
+            if state == .finished && !MDQueryIsGatheringComplete(query) { return [:] }
+        }
         var result: [String: Dates] = [:]
         for index in 0..<MDQueryGetResultCount(query) {
             if Task.isCancelled { return [:] }

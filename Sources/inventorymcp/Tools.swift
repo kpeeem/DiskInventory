@@ -91,7 +91,7 @@ struct StoredScan {
     }
 }
 
-final class ScanStore {
+final class ScanStore: @unchecked Sendable {
     static let defaultMaxAge: Double = 1800
     static let retention: Double = 86_400
 
@@ -103,7 +103,6 @@ final class ScanStore {
     private final class Job {
         let finished = DispatchGroup()
         let started = ContinuousClock.now
-        var superseded = false
         var task: Task<Void, Never>?
         var result: Result<StoredScan, Error>?
         var waiters = 0
@@ -111,6 +110,7 @@ final class ScanStore {
         init() { finished.enter() }
     }
 
+    private let readSnapshot: @Sendable (URL, Bool) throws -> ScanSummary
     private let lock = NSLock()
     private var scans: [Key: StoredScan] = [:]
     private var jobs: [Key: Job] = [:]
@@ -118,7 +118,10 @@ final class ScanStore {
     private let nodeLimit = 4_000_000
     private let eviction = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
 
-    init() {
+    init(readSnapshot: @escaping @Sendable (URL, Bool) throws -> ScanSummary = { url, finderKinds in
+        try InventoryScanner.scan(url, ignoreCreatorCode: !finderKinds)
+    }) {
+        self.readSnapshot = readSnapshot
         eviction.schedule(deadline: .now() + .seconds(60), repeating: .seconds(60))
         eviction.setEventHandler { [weak self] in
             guard let self else { return }
@@ -151,9 +154,8 @@ final class ScanStore {
             jobs[key] = job
             job.task = Task.detached(priority: .userInitiated) {
                 let started = ContinuousClock.now
-                let result = Result {
-                    let snapshot = try InventoryScanner.scan(URL(filePath: path, directoryHint: .isDirectory),
-                                                             ignoreCreatorCode: !finderKinds)
+                var result = Result {
+                    let snapshot = try self.readSnapshot(URL(filePath: path, directoryHint: .isDirectory), finderKinds)
                     let held = snapshot.heldByClones()
                     let duration = started.duration(to: .now).components
                     return StoredScan(snapshot: snapshot, path: path, finderKinds: finderKinds,
@@ -161,17 +163,19 @@ final class ScanStore {
                                       finishedAt: .now, held: held)
                 }
                 self.lock.withLock {
-                    if job.waiters > 0, !job.superseded, case var .success(scan) = result {
-                        for (otherKey, other) in self.jobs where otherKey.path == key.path && other.started < job.started {
-                            other.superseded = true
+                    if self.jobs[key] === job {
+                        self.jobs.removeValue(forKey: key)
+                        if job.waiters > 0, case var .success(scan) = result {
+                            // Existing waiters own their job. New callers may only join a current scan.
+                            self.jobs = self.jobs.filter { otherKey, other in
+                                otherKey.path != key.path || other.started >= job.started
+                            }
+                            scan.cached = self.cache(scan, for: key)
+                            result = .success(scan)
                         }
-                        scan.cached = self.cache(scan, for: key)
-                        job.result = .success(scan)
-                    } else {
-                        job.result = result
                     }
+                    job.result = result
                     job.task = nil
-                    self.jobs.removeValue(forKey: key)
                     job.finished.leave()
                 }
             }

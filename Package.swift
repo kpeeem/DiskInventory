@@ -12,6 +12,7 @@ let package = Package(
         .target(name: "InventoryCore"),
         .executableTarget(name: "DiskInventory", dependencies: ["InventoryCore"]),
         .executableTarget(name: "inventorymcp", dependencies: ["InventoryCore"], swiftSettings: [.swiftLanguageMode(.v5)]),
-        .testTarget(name: "InventoryCoreTests", dependencies: ["InventoryCore"])
+        .testTarget(name: "InventoryCoreTests", dependencies: ["InventoryCore"]),
+        .testTarget(name: "InventoryMCPTests", dependencies: ["inventorymcp", "InventoryCore"])
     ]
 )
